@@ -40,8 +40,12 @@ venv's `.pth` files get the macOS hidden flag, and Python skips hidden `.pth` fi
 ## Files
 
 - `ppo_demo.py`: minimal masked PPO. One network self-plays all four seats, with per-seat
-  GAE. It ends with 100 games against random, recorded to `eval_games.fcev`. To view them:
-  `fastcatan-viz-convert eval_games.fcev --finished --limit 20`, then `fastcatan-viz`.
+  GAE. `record()` plays games one at a time on a `fastcatan.Env` and writes `.jsonl.gz`
+  with `fastcatan_viz.GameLogWriter`, including the value per PPO move. Games in one file
+  must be sequential, so batched games can't share a file. It records 4 self-play games
+  before training and 4 after (same boards), plus 4 against random.
+  `win_rate_vs_random()` plays 100 batched games without recording. Weights are saved
+  to `ppo.pt`. View recordings with `fastcatan-viz`.
 
 Planned: AlphaZero (the main agent), Q-learning, and an Alpha-Beta port from Catanatron.
 

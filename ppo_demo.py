@@ -1,12 +1,15 @@
 """Minimal PPO self-play on fastCatan: one network plays all four seats."""
 
+import time
+
 import fastcatan as fc
 import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
+from fastcatan_viz import GameLogWriter
 
-NUM_ENVS, STEPS, UPDATES = 256, 128, 100
+NUM_ENVS, STEPS, UPDATES = 256, 128, 1500  # 1500 x 256 x 128 = 49M steps
 LR, GAMMA, LAMBDA, CLIP, ENT_COEF = 2.5e-4, 0.999, 0.95, 0.2, 0.01
 EPOCHS, MINIBATCHES = 4, 8
 
@@ -70,6 +73,7 @@ def train():
     env = fc.BatchedEnv(NUM_ENVS, seed=0)
     env.reset()
     done = np.zeros(NUM_ENVS, np.uint8)
+    total_games, start = 0, time.time()
 
     for update in range(1, UPDATES + 1):
         # Collect STEPS steps in every game.
@@ -120,34 +124,64 @@ def train():
                 loss.backward()
                 opt.step()
 
-        games = int(np.stack(buf["done"]).sum())
-        print(f"update {update}/{UPDATES}  games finished {games}  entropy {d.entropy().mean():.2f}")
+        total_games += int(np.stack(buf["done"]).sum())
+        print(f"update {update}/{UPDATES}  games finished {total_games}  "
+              f"entropy {d.entropy().mean():.2f}  {time.time() - start:.0f}s")
 
 
 @torch.no_grad()
-def play_vs_random(games=100, log_path="eval_games.fcev"):
-    """PPO in seats 0 and 2, uniformly random in seats 1 and 3. Games are saved to log_path."""
-    env = fc.BatchedEnv(games, seed=1)
-    env.enable_log(fc.log.LOG_GAMES | fc.log.LOG_ACTIONS, capacity_per_env=64)  # before reset
+def record(path, games=4, ppo_seats=(0, 1, 2, 3), seed=1):
+    """Play games one at a time, PPO in ppo_seats and random elsewhere, saved for the viewer."""
+    agents = ["ppo" if s in ppo_seats else "random" for s in range(4)]
+    obs = np.zeros(fc.OBS_SIZE, np.float32)
+    mask = np.zeros(fc.NUM_ACTIONS, bool)
+    with GameLogWriter(path) as log:
+        for g in range(games):
+            env = fc.Env()
+            env.reset(seed + g)
+            rec = log.start_game(env, seed=seed + g, agents=agents)
+            while not env.done:
+                seat = env.actor_to_act
+                env.write_obs(seat, obs)
+                env.action_mask_dense(mask)
+                if seat in ppo_seats:
+                    o = torch.from_numpy(obs).to(device)[None]
+                    m = torch.from_numpy(mask).to(device)[None]
+                    action = int(dist(o, m).sample())
+                    info = {"value": round(value(o).item(), 3)}  # shown in the viewer
+                else:
+                    action = int(np.random.choice(np.flatnonzero(mask)))
+                    info = None
+                env.step(action)
+                rec.record(action, info=info)
+    print(f"saved {games} games to {path}")
+
+
+@torch.no_grad()
+def win_rate_vs_random(games=100, seed=1000):
+    """PPO in seats 0 and 2, random in seats 1 and 3, all games at once. Chance is 50%."""
+    env = fc.BatchedEnv(games, seed=seed)
     env.reset()
     status = np.zeros((games, fc.STATUS_INTS), np.int32)
     done = np.zeros(games, np.uint8)
-    with fc.events.EventWriter(log_path, agents=["ppo", "random", "ppo", "random"]) as log:
-        while True:
-            env.write_status(status)  # columns: done, winner, turn_count, current_player, truncated
-            if status[:, 0].all():
-                break
-            obs, mask, seat = observe(env, games)
-            ppo = dist(obs, mask).sample().cpu().numpy()
-            rnd = np.where(mask.cpu().numpy(), np.random.rand(games, fc.NUM_ACTIONS), -1).argmax(1)
-            actions = np.where(seat % 2 == 0, ppo, rnd).astype(np.uint32)
-            actions[status[:, 0] == 1] = fc.NO_ACTION  # leave finished games alone
-            env.step(actions, done)
-            log.drain(env)  # move this step's recorded rows into the file
+    while True:
+        env.write_status(status)  # columns: done, winner, turn_count, current_player, truncated
+        if status[:, 0].all():
+            break
+        obs, mask, seat = observe(env, games)
+        ppo = dist(obs, mask).sample().cpu().numpy()
+        rnd = np.where(mask.cpu().numpy(), np.random.rand(games, fc.NUM_ACTIONS), -1).argmax(1)
+        actions = np.where(seat % 2 == 0, ppo, rnd).astype(np.uint32)
+        actions[status[:, 0] == 1] = fc.NO_ACTION  # leave finished games alone
+        env.step(actions, done)
     ppo_wins = int(((status[:, 4] == 0) & (status[:, 1] % 2 == 0)).sum())
-    print(f"PPO won {ppo_wins}/{games} games vs random (chance: 50%), saved to {log_path}")
+    print(f"PPO won {ppo_wins}/{games} games vs random (chance: 50%)")
 
 
 if __name__ == "__main__":
+    record("selfplay_start.jsonl.gz")  # untrained network against itself
     train()
-    play_vs_random()
+    torch.save({"policy": policy.state_dict(), "value": value.state_dict()}, "ppo.pt")
+    record("selfplay_end.jsonl.gz")  # trained network against itself, same 4 boards
+    record("vs_random.jsonl.gz", ppo_seats=(0, 2))
+    win_rate_vs_random()
