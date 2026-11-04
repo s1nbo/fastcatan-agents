@@ -1,0 +1,228 @@
+{
+  "algo": "ppo",
+  "search": "s1",
+  "stage": 1,
+  "hours": 1.0,
+  "trials": 16,
+  "configs": [
+    {},
+    {
+      "LR": 0.0001300417909571749,
+      "ENT_COEF": 0.0025032699681422667,
+      "GAMMA": 0.995,
+      "LAMBDA": 0.9,
+      "CLIP": 0.1,
+      "EPOCHS": 2,
+      "NUM_ENVS": 512
+    },
+    {
+      "LR": 0.00024540128471462115,
+      "ENT_COEF": 0.007871809912482115,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.3,
+      "EPOCHS": 4,
+      "NUM_ENVS": 1024
+    },
+    {
+      "LR": 0.0002583412035421633,
+      "ENT_COEF": 0.016036685991738298,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.9,
+      "CLIP": 0.2,
+      "EPOCHS": 8,
+      "NUM_ENVS": 1024
+    },
+    {
+      "LR": 0.00016098177110656302,
+      "ENT_COEF": 0.001817459118418354,
+      "GAMMA": 0.995,
+      "LAMBDA": 0.9,
+      "CLIP": 0.3,
+      "EPOCHS": 2,
+      "NUM_ENVS": 1024
+    },
+    {
+      "LR": 5.981817311342002e-05,
+      "ENT_COEF": 0.004210757962128051,
+      "GAMMA": 0.999,
+      "LAMBDA": 0.9,
+      "CLIP": 0.1,
+      "EPOCHS": 2,
+      "NUM_ENVS": 512
+    },
+    {
+      "LR": 0.00013314067864061608,
+      "ENT_COEF": 0.00810958122465847,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.2,
+      "EPOCHS": 4,
+      "NUM_ENVS": 2048
+    },
+    {
+      "LR": 0.000287049366997011,
+      "ENT_COEF": 0.010295054174033043,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.95,
+      "CLIP": 0.3,
+      "EPOCHS": 8,
+      "NUM_ENVS": 2048
+    },
+    {
+      "LR": 4.094659187100856e-05,
+      "ENT_COEF": 0.011633911675930027,
+      "GAMMA": 0.999,
+      "LAMBDA": 0.98,
+      "CLIP": 0.2,
+      "EPOCHS": 4,
+      "NUM_ENVS": 512
+    },
+    {
+      "LR": 9.182408587307724e-05,
+      "ENT_COEF": 0.020600671929658324,
+      "GAMMA": 0.995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.2,
+      "EPOCHS": 4,
+      "NUM_ENVS": 2048
+    },
+    {
+      "LR": 6.29492624162966e-05,
+      "ENT_COEF": 0.007548370458368918,
+      "GAMMA": 0.999,
+      "LAMBDA": 0.95,
+      "CLIP": 0.2,
+      "EPOCHS": 8,
+      "NUM_ENVS": 1024
+    },
+    {
+      "LR": 0.00023302129244237983,
+      "ENT_COEF": 0.002165405869228828,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.95,
+      "CLIP": 0.1,
+      "EPOCHS": 2,
+      "NUM_ENVS": 1024
+    },
+    {
+      "LR": 0.0001837467059641309,
+      "ENT_COEF": 0.0022572397623834574,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.3,
+      "EPOCHS": 2,
+      "NUM_ENVS": 512
+    },
+    {
+      "LR": 6.504865411752287e-05,
+      "ENT_COEF": 0.0016671742532014058,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.95,
+      "CLIP": 0.3,
+      "EPOCHS": 8,
+      "NUM_ENVS": 2048
+    },
+    {
+      "LR": 3.3817582312910014e-05,
+      "ENT_COEF": 0.003958878025974221,
+      "GAMMA": 0.995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.1,
+      "EPOCHS": 8,
+      "NUM_ENVS": 512
+    },
+    {
+      "LR": 0.00011414414535570365,
+      "ENT_COEF": 0.002761915621827704,
+      "GAMMA": 0.9995,
+      "LAMBDA": 0.98,
+      "CLIP": 0.3,
+      "EPOCHS": 2,
+      "NUM_ENVS": 2048
+    }
+  ],
+  "space": {
+    "LR": [
+      "log",
+      3e-05,
+      0.0003
+    ],
+    "ENT_COEF": [
+      "log",
+      0.001,
+      0.03
+    ],
+    "GAMMA": [
+      0.995,
+      0.999,
+      0.9995
+    ],
+    "LAMBDA": [
+      0.9,
+      0.95,
+      0.98
+    ],
+    "CLIP": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "EPOCHS": [
+      2,
+      4,
+      8
+    ],
+    "NUM_ENVS": [
+      512,
+      1024,
+      2048
+    ]
+  },
+  "defaults": {
+    "NUM_ENVS": 1024,
+    "STEPS": 128,
+    "LR": 0.0001,
+    "GAMMA": 0.999,
+    "LAMBDA": 0.95,
+    "CLIP": 0.2,
+    "ENT_COEF": 0.01,
+    "VF_COEF": 0.5,
+    "MAX_GRAD_NORM": 0.5,
+    "EPOCHS": 4,
+    "MINIBATCH": 16384,
+    "P_SELFPLAY": 0.8,
+    "WIDTH": 1024,
+    "DEPTH": 5,
+    "SNAPSHOT_EVERY": 20000,
+    "CKPT_EVERY": 100000000,
+    "MONITOR_EVERY": 3600,
+    "RESUME_EVERY": 600
+  },
+  "rank_by": "vs_ref",
+  "evals": {
+    "vs_ref": "the reference (trial 00), trades on",
+    "vs_ab1": "Alpha-Beta K=1, player trades off",
+    "vs_random": "random, trades on"
+  },
+  "eval_games": 400,
+  "selfplay_games": 200,
+  "eval_seed": 7000,
+  "trial_seed": 1,
+  "draw_seed": 0,
+  "created": "2026-11-03 20:43",
+  "code": {
+    "commit": "6a875ec416ea930d12da2117d1d8dca5947fa66f",
+    "dirty": true
+  },
+  "versions": {
+    "fastcatan": "2.2.3",
+    "torch": "2.5.1+cu124",
+    "python": "3.12.4"
+  },
+  "machine": {
+    "host": "macintosh",
+    "cpus": 24,
+    "gpu": "NVIDIA GeForce RTX 4070"
+  }
+}

@@ -7,9 +7,15 @@ Agent interface (every agent has a `name` and this method):
 
 `env` is the BatchedEnv, `idx` the game slots this agent moves in, `obs` / `mask` / `seat`
 the rows of those slots, `rules` the TradeRules. `values` (or None) are shown in the viewer.
+
+Every entry script sets OMP_NUM_THREADS=1 (unless it is already set) before it imports
+numpy, torch or fastcatan. Each brings its own OpenMP pool with one thread per core, and
+together they made fastcatan's batched reads 10-25x slower (PPO ran 1.5x slower overall).
 """
 
 import json
+import os
+import platform
 import re
 import subprocess
 import time
@@ -17,7 +23,10 @@ from pathlib import Path
 
 import fastcatan as fc
 import numpy as np
+import torch
 from torch import nn
+
+torch.set_float32_matmul_precision("high")  # TF32 matmuls (Ampere+): PPO 1024 x 5 ran 1.2x faster
 
 A = fc.action
 ADD = slice(A.TRADE_ADD_GIVE_BASE, A.TRADE_ADD_WANT_BASE + 5)  # add one card to an offer
@@ -114,7 +123,7 @@ def play(agents, games, seed, trades_on=True, log_path=None, events=None):
             env.enable_log(fc.log.LOG_ALL, capacity_per_env=256)
         env.reset()
         return run(agents, env, TradeRules(games, trades_on), events=events)
-    from fastcatan_viz import GameLogWriter
+    from fastcatan.viz import GameLogWriter
 
     status = []
     with GameLogWriter(log_path) as log:
@@ -189,17 +198,66 @@ def run_dir(name, config):
     """Create runs/<name>/ (never reused) and write config.json with the fastCatan build."""
     path = ROOT / "runs" / name
     (path / "games").mkdir(parents=True)
+    (path / "pool").mkdir()
 
     def git(*args):
-        return subprocess.run(["git", "-C", str(FASTCATAN), *args], capture_output=True, text=True).stdout.strip()
+        out = subprocess.run(["git", "-C", str(FASTCATAN), *args], capture_output=True, text=True)
+        return out.stdout.strip() if out.returncode == 0 else None
 
+    commit = git("rev-parse", "HEAD")
+    if commit is None:
+        print(f"warning: {FASTCATAN} is not a fastCatan checkout; config.json gets no commit", flush=True)
     cache = sorted(FASTCATAN.glob("build/*/CMakeCache.txt"), key=lambda p: p.stat().st_mtime)
     compiler = re.search(r"CMAKE_CXX_COMPILER:\w+=(.*)", cache[-1].read_text()) if cache else None
-    config = dict(config, fastcatan=fc.__version__, fastcatan_commit=git("rev-parse", "HEAD"),
-                  fastcatan_dirty=bool(git("status", "--porcelain")),
-                  compiler=compiler.group(1) if compiler else None, started=time.strftime("%Y-%m-%d %H:%M"))
+    config = dict(config, fastcatan=fc.__version__, fastcatan_commit=commit,
+                  fastcatan_dirty=None if commit is None else bool(git("status", "--porcelain")),
+                  compiler=compiler.group(1) if compiler else None, torch=torch.__version__,
+                  gpu=torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+                  host=platform.node(), omp_threads=os.environ.get("OMP_NUM_THREADS"),
+                  started=time.strftime("%Y-%m-%d %H:%M"))
     (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     return path
+
+
+def resume_run(name, hours=None):
+    """For --resume: (run dir, its config.json, its resume.pt), or None if runs/<name>/ is new.
+
+    `hours`, if given, becomes the run's new total budget. Metrics rows logged after resume.pt was
+    written (work the crash threw away) are dropped, so metrics.jsonl keeps one timeline."""
+    path = ROOT / "runs" / name
+    if not path.exists():
+        return None
+    if not (path / "resume.pt").exists():
+        raise SystemExit(f"{path} has no resume.pt to continue from; delete it to start over")
+    config = json.loads((path / "config.json").read_text())
+    if hours is not None and hours != config["hours"]:
+        config["hours"] = hours
+        (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    state = torch.load(path / "resume.pt", map_location="cpu", weights_only=True)
+
+    def before_save(line):
+        try:
+            return json.loads(line).get("hours", 0) <= state["elapsed"] / 3600
+        except json.JSONDecodeError:  # a line cut off by the crash
+            return False
+
+    metrics = path / "metrics.jsonl"
+    rows = metrics.read_text().splitlines() if metrics.exists() else []
+    metrics.write_text("".join(r + "\n" for r in rows if before_save(r)))
+    print(f"resuming {path} at {state['elapsed'] / 3600:.2f} of {config['hours']} hours, with its config.json",
+          flush=True)
+    return path, config, state
+
+
+def save_resume(path, state, pool_ids):
+    """Write <run>/resume.pt atomically (a crash mid-write keeps the previous one), then delete the
+    pool snapshots the league no longer holds. Snapshots evicted since the previous save survive
+    until this one, so every file that resume.pt names exists."""
+    torch.save(state, path / "resume.tmp")
+    os.replace(path / "resume.tmp", path / "resume.pt")
+    for f in (path / "pool").glob("*.pt"):
+        if int(f.stem) not in pool_ids:
+            f.unlink()
 
 
 class Trunk(nn.Module):

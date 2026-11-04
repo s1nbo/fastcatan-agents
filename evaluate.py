@@ -14,6 +14,10 @@ Rows are appended to results/eval.jsonl; --events saves one trade log per seatin
 training step mean no cycling.
 """
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
+
 import argparse
 import importlib
 import json
@@ -36,7 +40,7 @@ def load(spec, seed=0):
         from alphabeta import K, AlphaBeta
 
         return AlphaBeta(k=int(spec.split(":")[1]) if ":" in spec else K, seed=seed)
-    module, cls = AGENTS[torch.load(spec, map_location="cpu").get("algo", "ppo")]
+    module, cls = AGENTS[torch.load(spec, map_location="cpu", weights_only=True).get("algo", "ppo")]
     return getattr(importlib.import_module(module), cls).load(spec)
 
 
@@ -103,6 +107,7 @@ def main():
     p.add_argument("--events", help="save trade event logs (<path>.A02.fcev, ...) for metrics.py")
     args = p.parse_args()
     trades_a, trades_b = args.trades_a == "on", args.trades_b == "on"
+    torch.manual_seed(args.seed)  # PPO samples its moves with torch's RNG
 
     if args.mode == "vs":
         a, b = load(args.agents[0], seed=1), load(args.agents[1], seed=2)

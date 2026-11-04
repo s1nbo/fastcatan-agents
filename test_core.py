@@ -1,5 +1,9 @@
 """Hand-case checks for the tricky parts. Run: .venv/bin/python -m pytest -q"""
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
+
 import fastcatan as fc
 import numpy as np
 import pytest
@@ -177,3 +181,47 @@ def test_probs_are_distributions_over_legal_actions():
     for agent in (RandomAgent(0), PPOAgent(), DQNAgent(eps=0.1), AZAgent(n_sims=0), AZAgent(n_sims=4), AlphaBeta(k=1)):
         p = agent.probs(env, np.arange(n), obs, mask, seat, rules)
         assert p.shape == (n, fc.NUM_ACTIONS) and np.allclose(p.sum(1), 1, atol=1e-5) and (p[~mask] < 1e-6).all()
+
+
+def test_league_state_round_trip():
+    league = League(8, 0.5, size=4, seed=0)
+    for i in range(1, 7):  # 6 snapshots into 3 slots: random evictions
+        league.add(RandomAgent(i), id=i)
+    league.winrate[1], league.games = 0.9, 42
+    copy_ = League(8, 0.5, size=4, seed=1)
+    copy_.load_state(league.state(), lambda id: RandomAgent(id))
+    assert copy_.ids == league.ids and copy_.winrate == league.winrate and copy_.games == 42
+    partial = League(8, 0.5, size=4, seed=1)  # a missing file stops the sync; the rest waits for the next one
+    partial.sync(league.ids, lambda id: None if id == league.ids[2] else RandomAgent(id))
+    assert partial.ids == league.ids[:2]
+
+
+def test_ppo_resume_after_a_crash(tmp_path, monkeypatch):
+    import json
+
+    import torch
+
+    import common
+    import ppo
+
+    monkeypatch.setattr(common, "ROOT", tmp_path)
+    for k in [k for k in vars(ppo) if k.isupper()]:  # train() overrides the module constants
+        monkeypatch.setattr(ppo, k, getattr(ppo, k))
+    cfg = dict(NUM_ENVS=128, STEPS=16, WIDTH=32, DEPTH=1, SNAPSHOT_EVERY=5, RESUME_EVERY=1, CKPT_EVERY=50_000)
+    ppo.train("r", 3, 0.002, True, cfg)
+    run = tmp_path / "runs" / "r"
+    with open(run / "metrics.jsonl", "a") as f:  # the crash: a row after the last save, a line cut off
+        f.write(json.dumps(dict(update=10**6, hours=99.0)) + '\n{"upd')
+    (run / "pool" / "999.pt").write_bytes(b"")  # a snapshot the saved league no longer holds
+
+    ppo.train("r", hours=0.004, resume=True)
+    rows = [json.loads(line) for line in open(run / "metrics.jsonl")]
+    hours = [r["hours"] for r in rows]
+    assert hours == sorted(hours) and max(hours) < 99 and sum("resumed" in r for r in rows) == 1
+    state = torch.load(run / "resume.pt", weights_only=True)
+    assert state["resumes"] == 1 and state["elapsed"] >= 0.004 * 3600 and state["snapshots"] > 0
+    assert json.loads((run / "config.json").read_text())["seed"] == 3
+    on_disk = {int(p.stem) for p in (run / "pool").glob("*.pt")}
+    assert on_disk == {i for i in state["league"]["ids"] if i is not None}
+    ckpts = sorted(p.name for p in run.glob("ckpt_*.pt"))
+    assert ckpts[0] == f"ckpt_{0:012d}.pt" and ckpts[-1] == f"ckpt_{state['env_steps']:012d}.pt" and len(ckpts) > 2

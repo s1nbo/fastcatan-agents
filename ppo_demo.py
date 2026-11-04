@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.distributions import Categorical
-from fastcatan_viz import GameLogWriter
+from fastcatan.viz import GameLogWriter
 
 NUM_ENVS, STEPS, UPDATES = 256, 128, 1500  # 1500 x 256 x 128 = 49M steps
 LR, GAMMA, LAMBDA, CLIP, ENT_COEF = 2.5e-4, 0.999, 0.95, 0.2, 0.01

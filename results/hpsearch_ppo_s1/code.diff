@@ -1,0 +1,1897 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 971a5cb..9c5fa87 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -12,8 +12,8 @@ rates?), and stability.
+ 
+ - **Keep it simple.** Flat scripts plus `common.py` and `league.py`. No package, framework or
+   SLURM scripts. Settings are constants at the top of each file. Trainers take only
+-  `--name --seed --hours --no-trades --config` (`--config` = JSON overrides of the constants,
+-  e.g. from `hpsearch.py`). Ask before adding structure.
++  `--name --seed --hours --no-trades --config --resume` (`--config` = JSON overrides of the
++  constants, e.g. from `hpsearch.py`). Ask before adding structure.
+ - **Clean slate.** Don't copy code or results from earlier experiments. Catanatron is
+   GPL-3.0: use only its ideas and numbers, never its code.
+ - **Leave fastCatan alone.** Never modify it from here. Missing features go under "Requests
+@@ -40,14 +40,19 @@ rates?), and stability.
+     the true state.
+ - **AlphaZero search** is ISMCTS. It re-determinizes for every simulation, and leaves are
+   evaluated from `write_obs(acting seat)` only.
+-- **Experiments.** Seed everything and keep every checkpoint. Evaluate fixed checkpoints in
+-  a separate run (`evaluate.py`), never during training beyond light monitoring.
++- **Experiments.** Seed everything and keep every `ckpt_*.pt` (every `CKPT_EVERY` = 100M env
++  steps, plus the final one). Evaluate fixed checkpoints in a separate run (`evaluate.py`),
++  never during training beyond light monitoring.
++- **Crashes.** Training is not on SLURM, so every trainer writes `resume.pt` every
++  `RESUME_EVERY` = 600 s. `--resume` continues `runs/<name>/` from it with the run's own
++  settings (or starts the run if it is new; `--hours` then sets a new total). Games in progress
++  and replay buffers are not saved. Restart loop: `until python ppo.py --name X --resume; do sleep 60; done`.
+ 
+ ## Setup
+ 
+ ```bash
+ uv venv --python 3.12
+-uv pip install ../fastcatan ../fastcatan/viz torch numpy pytest
++uv pip install ../fastcatan torch numpy pytest matplotlib  # viewer ships inside fastcatan since 2.2.3
+ uv pip install --reinstall --no-cache ../fastcatan    # after changing fastCatan
+ .venv/bin/python -m pytest -q test_core.py
+ ```
+@@ -59,18 +64,18 @@ venv's `.pth` files get the macOS hidden flag, and Python skips hidden `.pth` fi
+ 
+ | File | What it is |
+ |---|---|
+-| `common.py` | `observe`, `TradeRules` / `trade_mask`, `play()` (batched matches; with `log_path`, viewer recordings one game at a time), `RandomAgent`, `wins`, `wilson`, `run_dir`, `log`, `Trunk` (the body of every net: `WIDTH` × `DEPTH`, residual layers with LayerNorm) |
+-| `league.py` | `League`: a pool of frozen past learners, at most 20 (random eviction, random agent kept as anchor). PFSP weights (1−p)²+0.05. Per-slot lineups: either pure self-play or the learner in {0,2}/{1,3} against one pool opponent. Only learner seats train. |
++| `common.py` | `observe`, `TradeRules` / `trade_mask`, `play()` (batched matches; with `log_path`, viewer recordings one game at a time), `RandomAgent`, `wins`, `wilson`, `run_dir`, `resume_run` / `save_resume` (crash recovery), `log`, `Trunk` (the body of every net: `WIDTH` × `DEPTH`, residual layers with LayerNorm) |
++| `league.py` | `League`: a pool of frozen past learners, at most 20 (random eviction, random agent kept as anchor). `P_SELFPLAY` = 0.8 in every trainer (Catan rewards a mix of strategies more than countering specific ones). Every trainer adds a snapshot each `SNAPSHOT_EVERY` = 20k finished games (games, not steps: trading changes the steps per game). PFSP weights (1−p)²+0.05. Per-slot lineups: either pure self-play or the learner in {0,2}/{1,3} against one pool opponent. Only learner seats train. |
+ | `ppo.py` | masked PPO plus the league. Per-seat GAE: each seat's next state is its own next decision. |
+-| `alphazero.py` | Gumbel-root ISMCTS AlphaZero for one CUDA GPU: `ACTORS` self-play processes (one CPU core each, network copy on the GPU) feed one GPU learner, which sends weights every `SYNC_EVERY` s. Search generators batch leaves into one forward pass. Value head = one value per relative seat. |
++| `alphazero.py` | Gumbel-root ISMCTS AlphaZero for one CUDA GPU: `ACTORS` self-play processes (one CPU core each, network copy on the GPU) feed one GPU learner, which sends weights every `SYNC_EVERY` s together with the pool's snapshot ids (the learner decides the one shared pool; actors load `pool/<id>.pt`, and exit if the learner dies). Search generators batch leaves into one forward pass. Value head = one value per relative seat. |
+ | `dqn.py` | optional Double DQN with per-seat n-step returns, plus the league. |
+ | `alphabeta.py` | PIMC Alpha-Beta: depth 2, paranoid, with expectation over `enumerate_outcomes`. Our own value function, using Catanatron's feature list and weights. |
+ | `evaluate.py` | `vs A B` (`--seats 2v2` or `1v3`, Wilson CI) and `crossplay` (Bradley-Terry Elo, intransitive triples). Results go to `results/eval.jsonl`. `--events x.fcev` writes one trade log per seating (`x.A02.fcev`, ...). Each log's header names the agent in every seat, and `meta.trades` has the per-seat trade flags. |
+-| `hpsearch.py` | two stages per algorithm: random search over `SPACE` at the default net size, then `--sizes` trains the winner at every `WIDTH` × `DEPTH`. Short trials, ranked by per-seat win rate vs `ab:1` (trades off), then vs random. Best settings go to `results/hpsearch_<algo>_best.json`. |
++| `hpsearch.py` | two stages per algorithm: trial 00 = defaults plus random draws from `SPACE` at the default net size, then `--sizes` trains the winner at every `WIDTH` × `DEPTH` (large only). Equal-hours trials, one at a time; each final checkpoint plays trial 00 (ranking score), `ab:1` (trades off) and random, plus self-play trade stats. Resumable (`--search NAME`). Writes `results/hpsearch_<algo>_<search>/` (`plan.json`, `trials.jsonl`, `results.csv`, `report.md`, `figures/`) and `results/hpsearch_<algo>_best.json`; `--report` redoes the tables and figures. |
+ | `probe.py` | Q1/Q3/Q4: scripted good vs bad offers at real states, plus edits of the proposer's VP in the responder's observation at three offer ratios. AZ's lead probe uses its network. |
+ | `counterfactual.py` | Q2: at trades about to be confirmed, 2×N rollouts (confirm vs cancel, fresh dice). Gives the change in win probability for proposer, partner and outsiders. AZ rolls out with its network. |
+ | `metrics.py` | Q3/Q4/Q6 from trade logs: acceptance, offer rate and terms by lead; the lead slope with a game-bootstrap CI; reciprocity; acceptance per agent pair. Benefit comes from `results/eval.jsonl`. |
+-| `test_core.py` | 11 tests: per-seat GAE, trade rules, league, `enumerate_outcomes`, `determinize`, "AB never reads the true hidden state", MCTS, per-seating logs, `probs()` |
++| `test_core.py` | 13 tests: per-seat GAE, trade rules, league, `enumerate_outcomes`, `determinize`, "AB never reads the true hidden state", MCTS, per-seating logs, `probs()`, league state round trip, PPO resume after a crash |
+ | `ppo_demo.py` | the minimal standalone PPO example |
+ 
+ - **Agent interface:** `actions, values = agent.act(env, idx, obs, mask, seat, rules)` and
+@@ -79,15 +84,19 @@ venv's `.pth` files get the macOS hidden flag, and Python skips hidden `.pth` fi
+ - **Trade logs are for analysis.** They keep trade, game and END_TURN rows only (END_TURN rows
+   give per-turn VP for offer rates), so they can't be replayed.
+ - **Workflow:**
+-  1. `hpsearch.py <algo>`, then `hpsearch.py <algo> --sizes`, for PPO, DQN and AZ.
++  1. `hpsearch.py <algo> --search s1`, then `hpsearch.py <algo> --search s2 --sizes`, for PPO, DQN and AZ.
+   2. Train each best config for the same hours (`--config`).
+   3. `evaluate.py crossplay` across the algorithms.
+   4. Train the most promising one much longer.
+ - **Run outputs:** `runs/<name>/` holds `config.json` (constants, seed, fastCatan version,
+-  commit, dirty flag, compiler), `metrics.jsonl`, `ckpt_*.pt` and `games/*.jsonl.gz`.
+-- **Viewing games:** `.venv/bin/fastcatan-viz`.
++  commit, dirty flag, compiler, torch, GPU, host, OMP threads), `metrics.jsonl`,
++  `ckpt_<env steps>.pt` (kept), `pool/<id>.pt` (league snapshots, deleted when evicted),
++  `resume.pt` and `games/*.jsonl.gz` (every `MONITOR_EVERY` = 3600 s).
++- **Defaults are for multi-day runs** with large nets (1024 × 5; hpsearch only tries 1024–2048 wide,
++  3–7 deep). Schedules that must scale with the run are fractions of `--hours` (DQN `EPS_DECAY`).
++- **Viewing games:** `.venv/bin/fastcatan view`.
+ 
+-## fastCatan notes (v2.2.1 local build, OBS_VERSION 1)
++## fastCatan notes (v2.2.3, OBS_VERSION 1)
+ 
+ - 286 actions (`fc.action`) and 1089 observation floats. Observations are seat-relative:
+   the observer is always slot 0.
+@@ -107,6 +116,10 @@ venv's `.pth` files get the macOS hidden flag, and Python skips hidden `.pth` fi
+ - `Env.enumerate_outcomes(action)` returns (probability, snapshot) pairs for dice, dev
+   draws and steals.
+ - `fastcatan.tournament`, `fc.play` and `step_n` don't exist in 2.x, despite older notes.
++- The viewer is `fastcatan.viz` (was the separate `fastcatan_viz` package before 2.2.3).
++- **OpenMP threads.** fastCatan's batched reads, torch and MKL each bring an OpenMP pool with
++  one thread per core; together they made `observe` 10-25x slower. Every entry script sets
++  `OMP_NUM_THREADS=1` (unless already set) before its first import; keep that line first.
+ 
+ ## Requests for fastCatan
+ 
+diff --git a/README.md b/README.md
+index ffdaecd..345b358 100644
+--- a/README.md
++++ b/README.md
+@@ -11,7 +11,7 @@ CMake and a C++23 compiler):
+ ```bash
+ git clone git@github.com:s1nbo/fastcatan.git ../fastcatan
+ uv venv --python 3.12
+-uv pip install ../fastcatan ../fastcatan/viz torch numpy pytest
++uv pip install ../fastcatan torch numpy pytest matplotlib    # matplotlib: hpsearch figures
+ .venv/bin/python -m pytest -q test_core.py
+ ```
+ 
+@@ -30,6 +30,13 @@ stops after `--hours` of wall-clock time:
+ - `--config file.json` overrides the constants at the top of the file.
+ - AlphaZero runs `ACTORS` self-play processes (one CPU core each) that share the GPU with
+   the learner. Set `ACTORS` to about the number of free cores.
++- `--resume` continues `runs/<name>/` after a crash from its `resume.pt` (written every 10
++  minutes), with the run's own settings, or starts the run if it is new. With `--hours` it
++  sets a new total, so a finished run can also be trained longer. For long runs:
++
++  ```bash
++  until .venv/bin/python ppo.py --name ppo_on_s1 --seed 1 --hours 72 --resume; do sleep 60; done
++  ```
+ 
+ Each run writes `runs/<name>/`:
+ 
+@@ -37,21 +44,36 @@ Each run writes `runs/<name>/`:
+ |---|---|
+ | `config.json` | settings, seed, fastCatan version and commit |
+ | `metrics.jsonl` | one row per update (AZ: per minute): steps, hours, losses, steps per turn, win rate vs random |
+-| `ckpt_*.pt` | every checkpoint |
++| `ckpt_<env steps>.pt` | weights every 100M env steps and at the end, all kept |
++| `pool/<id>.pt` | the league's current snapshots (deleted when evicted) |
++| `resume.pt` | everything `--resume` needs, every 10 minutes |
+ | `games/*.jsonl.gz` | recorded self-play games for the viewer |
+ 
+ ## Pick and compare settings
+ 
+ ```bash
+-.venv/bin/python hpsearch.py ppo --trials 16 --hours 0.5 --parallel 2    # also: dqn, az
+-.venv/bin/python hpsearch.py ppo --sizes --hours 1 --parallel 2           # network width x depth
+-.venv/bin/python ppo.py --name ppo_best --hours 4 --config results/hpsearch_ppo_best.json
++until .venv/bin/python hpsearch.py ppo --search s1 --trials 16 --hours 1; do sleep 60; done   # also: dqn, az
++until .venv/bin/python hpsearch.py ppo --search s2 --sizes --hours 2; do sleep 60; done       # width x depth
++.venv/bin/python hpsearch.py ppo --search s1 --report     # redo the tables and figures
++.venv/bin/python ppo.py --name ppo_best --hours 72 --resume --config results/hpsearch_ppo_best.json
+ .venv/bin/python evaluate.py crossplay runs/ppo_best/ckpt_X.pt runs/dqn_best/ckpt_X.pt runs/az_best/ckpt_X.pt
+ ```
+ 
+-Stage 1 searches the training settings at the default network size (256 wide, 2 deep). Stage 2
+-trains the winner at every size in `SIZES` (up to 1024 wide, 7 deep) and adds the best size to
+-`results/hpsearch_<algo>_best.json`. Then train the most promising algorithm for much longer.
++- **Stage 1** trains trial 00 with the hand-set defaults and 15 random draws from `SPACE`, at the
++  default network size (1024 wide, 5 deep). **Stage 2** trains the stage-1 winner at every size in
++  `SIZES` (1024 or 2048 wide, 3, 5 or 7 deep: only large nets, since the goal is to beat
++  Alpha-Beta). `P_SELFPLAY` is fixed at 0.8 in every trainer and not searched.
++- Every trial trains for the same hours with the same seed, one at a time. Its final checkpoint
++  then plays 400 games (2v2, seats swapped, same boards) against trial 00 (the ranking score),
++  Alpha-Beta K=1 with trades off, and random; 200 games against itself measure its trading.
++- A search is resumable: rerun the same command after a crash (the `until` loop does it).
++- Everything for the write-up is in `results/hpsearch_<algo>_<search>/`: `plan.json` (protocol,
++  configs, versions, machine, `code.diff` if uncommitted), `trials.jsonl` (one row per trial),
++  `results.csv`, `report.md` and `figures/` (ranking, sensitivity or size heatmaps, learning
++  curves, trading; PDF and PNG). The `hpsearch.py` docstring has the full protocol.
++- The winner's settings go to `results/hpsearch_<algo>_best.json`. Then train the most promising
++  algorithm for much longer. The defaults are set for multi-day runs: league snapshots every 20k
++  finished games in every trainer, kept checkpoints every 100M env steps.
+ 
+ ## Evaluate and analyse
+ 
+@@ -77,7 +99,7 @@ All results are appended to `results/*.jsonl`.
+ ## Watch games
+ 
+ ```bash
+-.venv/bin/fastcatan-viz
++.venv/bin/fastcatan view
+ ```
+ 
+ Drop a `.jsonl.gz` file from `runs/<name>/games/` onto the viewer.
+diff --git a/alphazero.py b/alphazero.py
+index 185e59a..9b8a23e 100644
+--- a/alphazero.py
++++ b/alphazero.py
+@@ -1,10 +1,13 @@
+ """AlphaZero self-play with information-set search and a league, built for one CUDA GPU.
+ 
+-    python alphazero.py --name az_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json]
++    python alphazero.py --name az_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json] [--resume]
+ 
+ The tree search is Python on the CPU, so ACTORS self-play processes (one CPU core each) run
+ searches in parallel, each with its own copy of the network on the GPU. One learner process
+ trains on the GPU from their finished games and sends new weights every SYNC_EVERY seconds.
++The learner also decides the league: it writes each snapshot to <run>/pool/ and every weights
++message names the pool, so all actors share one pool. Run files and --resume as in ppo.py (the
++replay buffer is not saved). If an actor dies, the learner stops too, so --resume can restart all.
+ Set ACTORS to about the number of free CPU cores.
+ 
+ Search, for each decision of the acting seat (SO-ISMCTS: one shared tree):
+@@ -13,11 +16,15 @@ Search, for each decision of the acting seat (SO-ISMCTS: one shared tree):
+ - leaves are evaluated from write_obs(acting seat), so the network never sees the sampled
+   cards of other seats. Values are kept per seat; each seat picks what is best for itself;
+ - the tree branches on dice results; dev draws and steals are sampled by stepping;
+-- the root uses Gumbel top-k with sequential halving (about N_SIMS simulations; the
+-  halving rounds down); interior nodes use PUCT.
++- the root uses Gumbel top-k with sequential halving down to 2 candidates (N_SIMS
++  simulations, the mctx schedule); interior nodes use PUCT.
+ Training targets: the improved Gumbel policy and the final result of the game per seat.
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
+ import copy
+ import json
+@@ -29,16 +36,19 @@ import numpy as np
+ import torch
+ from torch import nn
+ 
+-from common import ADD, A, RandomAgent, TradeRules, Trunk, log, observe, one_hot, play, run_dir, trade_mask, wins
++from common import (ADD, A, RandomAgent, TradeRules, Trunk, log, observe, one_hot, play, resume_run, run_dir,
++                    save_resume, trade_mask, wins)
+ from league import League
+ 
+ ACTORS, NUM_ENVS, STEPS = 4, 64, 16  # self-play processes; games in each; decisions between messages
+ N_SIMS, TOP_K, C_PUCT, C_VISIT, C_SCALE = 32, 16, 1.5, 50, 0.1
+-LR, BATCH, REPLAY, REPLAY_RATIO = 1e-3, 1024, 200_000, 4  # each sample is trained on ~REPLAY_RATIO times
+-P_SELFPLAY = 0.8
+-WIDTH, DEPTH = 256, 2  # hidden units per layer, hidden layers of the shared trunk
+-SYNC_EVERY, SNAPSHOT_EVERY = 60, 10  # seconds between weight updates; updates between league snapshots
+-CKPT_EVERY, MONITOR_EVERY, LOG_EVERY = 900, 1800, 60  # seconds
++LR, BATCH, REPLAY, REPLAY_RATIO = 3e-4, 1024, 2_000_000, 4  # each sample is trained on ~REPLAY_RATIO times
++P_SELFPLAY = 0.8  # share of pure self-play games (the same in every trainer)
++WIDTH, DEPTH = 1024, 5  # hidden units per layer, hidden layers of the shared trunk
++SNAPSHOT_EVERY = 20_000  # finished games (all actors) between league snapshots (the same in every trainer)
++CKPT_EVERY = 100_000_000  # env steps between kept checkpoints (the same in every trainer)
++SYNC_EVERY, LOG_EVERY = 60, 60  # seconds
++MONITOR_EVERY, RESUME_EVERY = 3600, 600  # seconds (the same in every trainer)
+ 
+ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+@@ -147,15 +157,15 @@ class AZAgent:
+         root.logits, v = yield self.obs.copy()
+         prior, gumbel = root.logits[legal], self.rng.gumbel(size=len(legal))
+         cand = np.argsort(-(gumbel + prior))[:min(TOP_K, len(legal))]
+-        per_round = self.n_sims // max(1, int(np.ceil(np.log2(len(cand)))))
+-        while True:  # sequential halving
++        rounds, used = max(1, int(np.ceil(np.log2(len(cand))))), 0
++        while used < self.n_sims:  # sequential halving down to 2 candidates, n_sims in all (as in mctx)
++            visits = max(1, min(self.n_sims // (rounds * len(cand)), (self.n_sims - used) // len(cand)))
+             for c in cand:
+-                for _ in range(max(1, per_round // len(cand))):
++                for _ in range(visits):
+                     yield from self.simulate(root, snapshot, seat, legal[c], on, adds.copy(), offers.copy(), turn)
+-            if len(cand) == 1:
+-                break
++            used += visits * len(cand)
+             score = (gumbel + prior + self.sigma(root, legal, seat, 0.0))[cand]
+-            cand = cand[np.argsort(-score)][: len(cand) // 2]
++            cand = cand[np.argsort(-score)][: max(2, len(cand) // 2)]
+         target = np.zeros(fc.NUM_ACTIONS, np.float32)
+         logits = prior + self.sigma(root, legal, seat, (v[0] + 1) / 2)
+         target[legal] = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+@@ -207,7 +217,7 @@ class AZAgent:
+     @classmethod
+     def load(cls, path, n_sims=None):
+         """n_sims: the budget the checkpoint was trained with, unless given."""
+-        ckpt = torch.load(path, map_location=device)
++        ckpt = torch.load(path, map_location=device, weights_only=True)
+         net = Net(ckpt["width"], ckpt["depth"]).to(device)
+         net.load_state_dict(ckpt["net"])
+         return cls(net, n_sims=ckpt.get("n_sims", N_SIMS) if n_sims is None else n_sims)
+@@ -235,25 +245,37 @@ class Replay:
+                 for x in (self.obs, self.mask, self.pi, self.z)]
+ 
+ 
+-def actor(rank, seed, trades, config, samples, weights, stop):
+-    """Self-play process: NUM_ENVS games with search; sends every finished game to the learner."""
++def actor(rank, seed, trades, config, out, samples, weights, stop):
++    """Self-play process: NUM_ENVS games with search; sends every finished game to the learner.
++    Each weights message is (network weights, ids of the pool's snapshots in <run>/pool/)."""
+     globals().update(config or {})
+-    torch.manual_seed(seed + rank)
++    torch.manual_seed(seed * 1000 + rank)  # seed * 1000 + rank: no stream shared with another run's actors
+     torch.set_num_threads(1)
+-    agent = AZAgent(seed=seed + rank)
+-    agent.net.load_state_dict(weights.get())
++    agent = AZAgent(seed=seed * 1000 + rank)
+     env = fc.BatchedEnv(NUM_ENVS, seed=seed * 1000 + rank)
+     env.reset()
+     rules = TradeRules(NUM_ENVS, trades)
+-    league = League(NUM_ENVS, P_SELFPLAY, seed=seed + rank)
++    league = League(NUM_ENVS, P_SELFPLAY, seed=seed * 1000 + rank)
++
++    def load(id):
++        try:
++            return AZAgent.load(out / "pool" / f"{id}.pt")
++        except FileNotFoundError:  # just dropped from the pool: the next message has the new one
++            return None
++
++    def sync():
++        state, ids = weights.get()
++        agent.net.load_state_dict(state)
++        league.sync(ids, load)
++
++    sync()
+     pending = [[] for _ in range(NUM_ENVS)]  # samples of unfinished games, per slot
+-    done, steps_in_game, syncs = np.zeros(NUM_ENVS, np.uint8), np.zeros(NUM_ENVS, np.int64), 0
+-    while not stop.is_set():
+-        if not weights.empty():  # newer weights from the learner
+-            agent.net.load_state_dict(weights.get())
+-            syncs += 1
+-            if syncs % SNAPSHOT_EVERY == 0:
+-                league.add(agent)
++    done, steps_in_game = np.zeros(NUM_ENVS, np.uint8), np.zeros(NUM_ENVS, np.int64)
++    learner = os.getppid()
++    running = lambda: not stop.is_set() and os.getppid() == learner  # a killed learner leaves no orphans
++    while running():
++        if not weights.empty():  # newer weights and pool from the learner
++            sync()
+         sims, games, lengths = agent.sims, [], []
+         for _ in range(STEPS):  # the learner searches, pool opponents move in their seats
+             obs, mask, seat, status = observe(env, NUM_ENVS)
+@@ -262,8 +284,10 @@ def actor(rank, seed, trades, config, samples, weights, stop):
+             actions = np.zeros(NUM_ENVS, np.uint32)
+             if len(idx):
+                 actions[idx], _ = agent.act(env, idx, obs[idx], mask[idx], seat[idx], rules)
+-                for r in np.flatnonzero(agent.last[1]):
+-                    pending[idx[r]].append((obs[idx[r]], mask[idx[r]], agent.last[0][r], int(seat[idx[r]])))
++                for r in np.flatnonzero(agent.last[1]):  # copies: a row view would keep the whole step alive
++                    i = idx[r]
++                    pending[i].append((obs[i].astype(np.float16), mask[i].copy(), agent.last[0][r].astype(np.float16),
++                                       int(seat[i])))
+             league.opponents_act(env, obs, mask, seat, rules, actions)
+             env.step_autoreset(actions, done)
+             rules.count(actions, seat)
+@@ -281,7 +305,7 @@ def actor(rank, seed, trades, config, samples, weights, stop):
+                 steps_in_game[i] = 0
+         msg = dict(games=games, lengths=lengths, env_steps=STEPS * NUM_ENVS, sims=agent.sims - sims,
+                    pool_winrate=float(np.mean(league.winrate)))
+-        while not stop.is_set():
++        while running():
+             try:
+                 samples.put(msg, timeout=1)
+                 break
+@@ -290,36 +314,73 @@ def actor(rank, seed, trades, config, samples, weights, stop):
+     samples.cancel_join_thread()  # exit without waiting for unread messages
+ 
+ 
+-def train(name, seed, hours, trades, config=None):
+-    """Learner: trains on the GPU from the games of ACTORS self-play processes."""
++def train(name, seed=1, hours=None, trades=True, config=None, resume=False):
++    """Learner: trains on the GPU from the games of ACTORS self-play processes. resume: as in ppo.train."""
++    resumed = resume_run(name, hours) if resume else None
++    if resumed:
++        out, saved, state = resumed
++        seed, trades, hours = saved["seed"], saved["trades"], saved["hours"]
++        config = {k: v for k, v in saved.items() if k.isupper()}
++    else:
++        state, hours = None, 1.0 if hours is None else hours
++    if unknown := set(config or {}) - {k for k in globals() if k.isupper()}:
++        raise ValueError(f"--config has unknown constants: {sorted(unknown)}")
+     globals().update(config or {})  # overrides of the constants above, e.g. from hpsearch.py
+-    torch.manual_seed(seed)
+-    np.random.seed(seed)
+-    constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
+-    out = run_dir(name, dict(algo="az", seed=seed, hours=hours, trades=trades, **constants))
+-    rng = np.random.default_rng(seed)
+-    agent, rnd = AZAgent(seed=seed), RandomAgent(seed)
++    resumes = state["resumes"] + 1 if state else 0
++    rs = seed + 10_007 * resumes  # fresh random streams after each resume
++    torch.manual_seed(rs)
++    np.random.seed(rs)
++    if not state:
++        constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
++        out = run_dir(name, dict(algo="az", seed=seed, hours=hours, trades=trades, **constants))
++    rng = np.random.default_rng(rs)
++    agent, rnd = AZAgent(seed=rs), RandomAgent(rs)
+     opt = torch.optim.Adam(agent.net.parameters(), lr=LR, weight_decay=1e-4)
+     replay = Replay(REPLAY)
++    pool = League(0, P_SELFPLAY, seed=rs)  # which snapshots are in the pool; the actors hold the agents
++    elapsed, env_steps, sim_steps, steps, total_games = 0.0, 0, 0, 0, 0
++    snapshots = last_snapshot = 0  # snapshots taken; total_games at the last one
++    if state:
++        agent.net.load_state_dict(state["net"])
++        opt.load_state_dict(state["opt"])
++        pool.load_state(state["league"], lambda id: id)  # the ids stand in for agents: the learner plays no games
++        elapsed = state["elapsed"]
++        env_steps, sim_steps, steps, total_games, snapshots, last_snapshot = (
++            state[k] for k in ("env_steps", "sim_steps", "train_steps", "total_games", "snapshots", "last_snapshot"))
++        log(out, dict(resumed=resumes, hours=elapsed / 3600, env_steps=env_steps))
++    else:
++        agent.save(out / f"ckpt_{0:012d}.pt", train_steps=0, env_steps=0)
++
++    def message():
++        return {k: v.detach().cpu() for k, v in agent.net.state_dict().items()}, list(pool.ids)
+ 
+     ctx = torch.multiprocessing.get_context("spawn")
+     samples, stop = ctx.Queue(maxsize=4 * ACTORS), ctx.Event()
+     weights = [ctx.Queue() for _ in range(ACTORS)]
+-    state = {k: v.detach().cpu() for k, v in agent.net.state_dict().items()}
+     for q in weights:
+-        q.put(state)
+-    actors = [ctx.Process(target=actor, args=(r, seed, trades, config, samples, weights[r], stop), daemon=True)
++        q.put(message())
++    actors = [ctx.Process(target=actor, args=(r, rs, trades, config, out, samples, weights[r], stop), daemon=True)
+               for r in range(ACTORS)]
+     for a in actors:
+         a.start()
+ 
+-    start = time.time()
+-    last = dict(sync=start, log=start, ckpt=start, monitor=start)
+-    env_steps = sim_steps = steps = 0
++    start = time.time() - elapsed
++
++    def save_state():
++        save_resume(out, dict(resumes=resumes, elapsed=time.time() - start, env_steps=env_steps, sim_steps=sim_steps,
++                              train_steps=steps, total_games=total_games, snapshots=snapshots,
++                              last_snapshot=last_snapshot, net=agent.net.state_dict(), opt=opt.state_dict(),
++                              league=pool.state()), pool.ids)
++
++    save_state()
++    next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
++    now = time.time()
++    last = dict(sync=now, log=now, monitor=now, resume=now)
+     owed, losses, lengths, winrates = 0.0, [], [], []
+-    agent.save(out / "ckpt_0000000.pt", train_steps=0, env_steps=0)
+     try:
+         while time.time() - start < hours * 3600:
++            if not all(a.is_alive() for a in actors):
++                raise RuntimeError("an actor process died (its traceback is above); continue with --resume")
+             try:
+                 msg = samples.get(timeout=1)
+             except queue.Empty:
+@@ -330,7 +391,12 @@ def train(name, seed, hours, trades, config=None):
+                     owed = min(owed + len(g[0]) * REPLAY_RATIO / BATCH, 1000)
+                 env_steps, sim_steps = env_steps + msg["env_steps"], sim_steps + msg["sims"]
+                 lengths += msg["lengths"]
++                total_games += len(msg["lengths"])
+                 winrates.append(msg["pool_winrate"])
++            if total_games - last_snapshot >= SNAPSHOT_EVERY:  # the actors load it with the next weights
++                snapshots, last_snapshot = snapshots + 1, total_games
++                agent.save(out / "pool" / f"{snapshots}.pt", train_steps=steps, env_steps=env_steps)
++                pool.add(None, snapshots)
+             while owed >= 1 and replay.n >= 4 * BATCH:  # each sample is used about REPLAY_RATIO times
+                 obs, mask, pi, z = replay.sample(BATCH, rng)
+                 logits, v = agent.net(obs)
+@@ -344,23 +410,26 @@ def train(name, seed, hours, trades, config=None):
+ 
+             now = time.time()
+             if now - last["sync"] > SYNC_EVERY:
+-                state = {k: v.detach().cpu() for k, v in agent.net.state_dict().items()}
++                update = message()
+                 for q in weights:
+                     if q.empty():
+-                        q.put(state)
++                        q.put(update)
+                 last["sync"] = now
+-            if now - last["ckpt"] > CKPT_EVERY:
+-                agent.save(out / f"ckpt_{steps:07d}.pt", train_steps=steps, env_steps=env_steps)
+-                last["ckpt"] = now
++            if env_steps >= next_ckpt:  # kept for good, unlike the pool snapshots
++                agent.save(out / f"ckpt_{next_ckpt:012d}.pt", train_steps=steps, env_steps=env_steps)
++                next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
++            if now - last["resume"] > RESUME_EVERY:
++                save_state()
++                last["resume"] = time.time()
+             if now - last["log"] > LOG_EVERY:
+                 row = dict(train_steps=steps, env_steps=env_steps, sim_steps=sim_steps, hours=(now - start) / 3600,
+-                           games=len(lengths), replay=replay.n,
++                           games=len(lengths), total_games=total_games, replay=replay.n,
+                            steps_per_turn=sum(s for s, _ in lengths) / max(1, sum(t for _, t in lengths)),
+                            p_loss=float(np.mean([p for p, _ in losses])) if losses else None,
+                            v_loss=float(np.mean([v for _, v in losses])) if losses else None,
+                            pool_winrate=float(np.mean(winrates)) if winrates else None)
+                 if now - last["monitor"] > MONITOR_EVERY:
+-                    raw = AZAgent(agent.net, seed, n_sims=0)  # raw policy: cheap to play many games
++                    raw = AZAgent(agent.net, rs, n_sims=0)  # raw policy: cheap to play many games
+                     row["vs_random_raw"] = wins(play([raw, rnd, raw, rnd], 50, 10_000, trades), [0, 2]) / 50
+                     play([agent] * 4, 1, 20_000, trades, log_path=out / "games" / f"step_{steps:07d}.jsonl.gz")
+                     last["monitor"] = time.time()
+@@ -372,15 +441,19 @@ def train(name, seed, hours, trades, config=None):
+             a.join(timeout=30)
+             if a.is_alive():
+                 a.terminate()
+-    agent.save(out / f"ckpt_{steps:07d}.pt", train_steps=steps, env_steps=env_steps)
++    agent.save(out / f"ckpt_{env_steps:012d}.pt", train_steps=steps, env_steps=env_steps)
++    save_state()  # --resume --hours <more> trains on
+ 
+ 
+ if __name__ == "__main__":
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("--name", required=True)
+     p.add_argument("--seed", type=int, default=1)
+-    p.add_argument("--hours", type=float, default=1.0, help="wall-clock training budget")
++    p.add_argument("--hours", type=float, help="wall-clock training budget (default 1); with --resume: a new total")
+     p.add_argument("--no-trades", action="store_true", help="block player trades for every seat")
+     p.add_argument("--config", help="JSON file overriding the constants above (e.g. hpsearch's best)")
++    p.add_argument("--resume", action="store_true",
++                   help="continue runs/<name>/ from resume.pt with its own settings, or start it if it is new")
+     args = p.parse_args()
+-    train(args.name, args.seed, args.hours, not args.no_trades, json.load(open(args.config)) if args.config else None)
++    train(args.name, args.seed, args.hours, not args.no_trades,
++          json.load(open(args.config)) if args.config else None, args.resume)
+diff --git a/common.py b/common.py
+index 9fae622..1d5aef5 100644
+--- a/common.py
++++ b/common.py
+@@ -7,9 +7,15 @@ Agent interface (every agent has a `name` and this method):
+ 
+ `env` is the BatchedEnv, `idx` the game slots this agent moves in, `obs` / `mask` / `seat`
+ the rows of those slots, `rules` the TradeRules. `values` (or None) are shown in the viewer.
++
++Every entry script sets OMP_NUM_THREADS=1 (unless it is already set) before it imports
++numpy, torch or fastcatan. Each brings its own OpenMP pool with one thread per core, and
++together they made fastcatan's batched reads 10-25x slower (PPO ran 1.5x slower overall).
+ """
+ 
+ import json
++import os
++import platform
+ import re
+ import subprocess
+ import time
+@@ -17,8 +23,11 @@ from pathlib import Path
+ 
+ import fastcatan as fc
+ import numpy as np
++import torch
+ from torch import nn
+ 
++torch.set_float32_matmul_precision("high")  # TF32 matmuls (Ampere+): PPO 1024 x 5 ran 1.2x faster
++
+ A = fc.action
+ ADD = slice(A.TRADE_ADD_GIVE_BASE, A.TRADE_ADD_WANT_BASE + 5)  # add one card to an offer
+ PLAYER_TRADES = slice(A.TRADE_ADD_GIVE_BASE, A.TRADE_CANCEL + 1)
+@@ -114,7 +123,7 @@ def play(agents, games, seed, trades_on=True, log_path=None, events=None):
+             env.enable_log(fc.log.LOG_ALL, capacity_per_env=256)
+         env.reset()
+         return run(agents, env, TradeRules(games, trades_on), events=events)
+-    from fastcatan_viz import GameLogWriter
++    from fastcatan.viz import GameLogWriter
+ 
+     status = []
+     with GameLogWriter(log_path) as log:
+@@ -189,19 +198,68 @@ def run_dir(name, config):
+     """Create runs/<name>/ (never reused) and write config.json with the fastCatan build."""
+     path = ROOT / "runs" / name
+     (path / "games").mkdir(parents=True)
++    (path / "pool").mkdir()
+ 
+     def git(*args):
+-        return subprocess.run(["git", "-C", str(FASTCATAN), *args], capture_output=True, text=True).stdout.strip()
++        out = subprocess.run(["git", "-C", str(FASTCATAN), *args], capture_output=True, text=True)
++        return out.stdout.strip() if out.returncode == 0 else None
+ 
++    commit = git("rev-parse", "HEAD")
++    if commit is None:
++        print(f"warning: {FASTCATAN} is not a fastCatan checkout; config.json gets no commit", flush=True)
+     cache = sorted(FASTCATAN.glob("build/*/CMakeCache.txt"), key=lambda p: p.stat().st_mtime)
+     compiler = re.search(r"CMAKE_CXX_COMPILER:\w+=(.*)", cache[-1].read_text()) if cache else None
+-    config = dict(config, fastcatan=fc.__version__, fastcatan_commit=git("rev-parse", "HEAD"),
+-                  fastcatan_dirty=bool(git("status", "--porcelain")),
+-                  compiler=compiler.group(1) if compiler else None, started=time.strftime("%Y-%m-%d %H:%M"))
++    config = dict(config, fastcatan=fc.__version__, fastcatan_commit=commit,
++                  fastcatan_dirty=None if commit is None else bool(git("status", "--porcelain")),
++                  compiler=compiler.group(1) if compiler else None, torch=torch.__version__,
++                  gpu=torch.cuda.get_device_name() if torch.cuda.is_available() else None,
++                  host=platform.node(), omp_threads=os.environ.get("OMP_NUM_THREADS"),
++                  started=time.strftime("%Y-%m-%d %H:%M"))
+     (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+     return path
+ 
+ 
++def resume_run(name, hours=None):
++    """For --resume: (run dir, its config.json, its resume.pt), or None if runs/<name>/ is new.
++
++    `hours`, if given, becomes the run's new total budget. Metrics rows logged after resume.pt was
++    written (work the crash threw away) are dropped, so metrics.jsonl keeps one timeline."""
++    path = ROOT / "runs" / name
++    if not path.exists():
++        return None
++    if not (path / "resume.pt").exists():
++        raise SystemExit(f"{path} has no resume.pt to continue from; delete it to start over")
++    config = json.loads((path / "config.json").read_text())
++    if hours is not None and hours != config["hours"]:
++        config["hours"] = hours
++        (path / "config.json").write_text(json.dumps(config, indent=2) + "\n")
++    state = torch.load(path / "resume.pt", map_location="cpu", weights_only=True)
++
++    def before_save(line):
++        try:
++            return json.loads(line).get("hours", 0) <= state["elapsed"] / 3600
++        except json.JSONDecodeError:  # a line cut off by the crash
++            return False
++
++    metrics = path / "metrics.jsonl"
++    rows = metrics.read_text().splitlines() if metrics.exists() else []
++    metrics.write_text("".join(r + "\n" for r in rows if before_save(r)))
++    print(f"resuming {path} at {state['elapsed'] / 3600:.2f} of {config['hours']} hours, with its config.json",
++          flush=True)
++    return path, config, state
++
++
++def save_resume(path, state, pool_ids):
++    """Write <run>/resume.pt atomically (a crash mid-write keeps the previous one), then delete the
++    pool snapshots the league no longer holds. Snapshots evicted since the previous save survive
++    until this one, so every file that resume.pt names exists."""
++    torch.save(state, path / "resume.tmp")
++    os.replace(path / "resume.tmp", path / "resume.pt")
++    for f in (path / "pool").glob("*.pt"):
++        if int(f.stem) not in pool_ids:
++            f.unlink()
++
++
+ class Trunk(nn.Module):
+     """Obs -> `depth` hidden layers of `width` units, the body of every network.
+ 
+diff --git a/counterfactual.py b/counterfactual.py
+index 704ccb6..3823b96 100644
+--- a/counterfactual.py
++++ b/counterfactual.py
+@@ -10,12 +10,17 @@ play the rollouts with their network alone (a full search per move would take da
+ Rows go to results/counterfactual.jsonl: the summary and every trade with its context.
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
+ import copy
+ import json
+ 
+ import fastcatan as fc
+ import numpy as np
++import torch
+ 
+ from common import ROOT, A, TradeRules, run
+ from evaluate import load
+@@ -77,6 +82,7 @@ def main():
+     p.add_argument("--trades", type=int, default=200)
+     p.add_argument("--rollouts", type=int, default=200, help="per branch")
+     args = p.parse_args()
++    torch.manual_seed(0)  # PPO samples its moves with torch's RNG
+     agent = load(args.agent)
+     if getattr(agent, "n_sims", 0):  # AlphaZero: roll out with the network alone
+         agent = copy.copy(agent)
+diff --git a/dqn.py b/dqn.py
+index ed7c566..3c2ff52 100644
+--- a/dqn.py
++++ b/dqn.py
+@@ -1,12 +1,17 @@
+ """Q-learning (Double DQN) self-play with a league.
+ 
+-    python dqn.py --name dqn_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json]
++    python dqn.py --name dqn_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json] [--resume]
+ 
+ Each seat's transitions run from one of its decisions to its own N_STEP-th next decision
+ (the seat-stream idea of the PPO advantages); the game result reaches every seat's last
+ decisions. Epsilon-greedy over legal actions, a target network, and a replay buffer.
++Run files and --resume as in ppo.py (the replay buffer is not saved: it refills in seconds).
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
+ import copy
+ import json
+@@ -17,15 +22,19 @@ import numpy as np
+ import torch
+ from torch import nn
+ 
+-from common import RandomAgent, TradeRules, Trunk, log, observe, one_hot, play, run_dir, wins
++from common import RandomAgent, TradeRules, Trunk, log, observe, one_hot, play, resume_run, run_dir, save_resume, wins
+ from league import League
+ 
+-NUM_ENVS, N_STEP, GAMMA = 256, 5, 0.999
+-LR, BATCH, REPLAY, LEARN_START, TRAIN_EVERY, TARGET_EVERY = 1e-4, 512, 100_000, 20_000, 4, 2_000
+-EPS_END, EPS_STEPS = 0.05, 5_000_000  # epsilon decays linearly to EPS_END over EPS_STEPS env steps
+-P_SELFPLAY = 0.5
+-WIDTH, DEPTH = 256, 2  # hidden units per layer, hidden layers
+-SNAPSHOT_EVERY, CKPT_EVERY, MONITOR_EVERY, LOG_EVERY = 4_000, 4_000, 8_000, 500  # in batched steps
++NUM_ENVS, N_STEP, GAMMA = 512, 5, 0.999
++LR, BATCH, REPLAY, LEARN_START, TRAIN_EVERY, TARGET_EVERY = 3e-5, 512, 1_000_000, 100_000, 2, 2_000
++EPS_END, EPS_DECAY = 0.05, 0.02  # epsilon falls linearly to EPS_END over the first EPS_DECAY of --hours
++P_SELFPLAY = 0.8  # share of pure self-play games (the same in every trainer)
++WIDTH, DEPTH = 1024, 5  # hidden units per layer, hidden layers
++SNAPSHOT_EVERY = 20_000  # finished games between league snapshots (the same in every trainer)
++POOL_EPS = 0.02  # epsilon of the league's frozen copies
++LOG_EVERY = 500  # in batched steps
++CKPT_EVERY = 100_000_000  # env steps between kept checkpoints (the same in every trainer)
++MONITOR_EVERY, RESUME_EVERY = 3600, 600  # seconds (the same in every trainer)
+ 
+ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+@@ -45,9 +54,9 @@ class DQNAgent:
+     def act(self, env, idx, obs, mask, seat, rules):
+         """Epsilon-greedy over the legal actions."""
+         q = self.q(torch.from_numpy(obs).to(device)).masked_fill(~torch.from_numpy(mask).to(device), -1e9)
+-        best, value = q.argmax(1).cpu().numpy(), q.max(1).values.cpu().numpy()
+-        explore = self.rng.random(len(obs)) < self.eps
+-        best[explore] = np.where(mask, self.rng.random(mask.shape), -1).argmax(1)[explore]
++        value, best = (x.cpu().numpy() for x in q.max(1))
++        explore = np.flatnonzero(self.rng.random(len(obs)) < self.eps)
++        best[explore] = np.where(mask[explore], self.rng.random((len(explore), mask.shape[1])), -1).argmax(1)
+         return best.astype(np.uint32), value
+ 
+     @torch.no_grad()
+@@ -61,7 +70,7 @@ class DQNAgent:
+ 
+     @classmethod
+     def load(cls, path):
+-        ckpt = torch.load(path, map_location=device)
++        ckpt = torch.load(path, map_location=device, weights_only=True)
+         agent = cls(width=ckpt["width"], depth=ckpt["depth"])
+         agent.q.load_state_dict(ckpt["q"])
+         return agent
+@@ -90,29 +99,69 @@ class Replay:
+                                                          self.disc[j], self.next[j].astype(np.float32), mask)]
+ 
+ 
+-def train(name, seed, hours, trades, config=None):
++def pool_agent(out, id):
++    """League snapshot `id` from <run>/pool/, exploring with POOL_EPS."""
++    agent = DQNAgent.load(out / "pool" / f"{id}.pt")
++    agent.eps, agent.rng = POOL_EPS, np.random.default_rng(id)
++    return agent
++
++
++def train(name, seed=1, hours=None, trades=True, config=None, resume=False):
++    """resume: as in ppo.train."""
++    resumed = resume_run(name, hours) if resume else None
++    if resumed:
++        out, saved, state = resumed
++        seed, trades, hours = saved["seed"], saved["trades"], saved["hours"]
++        config = {k: v for k, v in saved.items() if k.isupper()}
++    else:
++        state, hours = None, 1.0 if hours is None else hours
++    if unknown := set(config or {}) - {k for k in globals() if k.isupper()}:
++        raise ValueError(f"--config has unknown constants: {sorted(unknown)}")
+     globals().update(config or {})  # overrides of the constants above, e.g. from hpsearch.py
+-    torch.manual_seed(seed)
+-    np.random.seed(seed)
+-    constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
+-    out = run_dir(name, dict(algo="dqn", seed=seed, hours=hours, trades=trades, **constants))
+-    rng = np.random.default_rng(seed)
+-
+-    agent, rnd = DQNAgent(eps=1.0, seed=seed), RandomAgent(seed)
++    resumes = state["resumes"] + 1 if state else 0
++    rs = seed + 10_007 * resumes  # fresh random streams after each resume
++    torch.manual_seed(rs)
++    np.random.seed(rs)
++    if not state:
++        constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
++        out = run_dir(name, dict(algo="dqn", seed=seed, hours=hours, trades=trades, **constants))
++    rng = np.random.default_rng(rs)
++
++    agent, rnd = DQNAgent(eps=1.0, seed=rs), RandomAgent(rs)
+     target, opt = copy.deepcopy(agent.q), torch.optim.Adam(agent.q.parameters(), lr=LR)
+-    env = fc.BatchedEnv(NUM_ENVS, seed=seed)
++    env = fc.BatchedEnv(NUM_ENVS, seed=rs)
+     env.reset()
+     rules = TradeRules(NUM_ENVS, trades)
+-    league = League(NUM_ENVS, P_SELFPLAY, seed=seed)
++    league = League(NUM_ENVS, P_SELFPLAY, seed=rs)
+     replay = Replay(REPLAY)
+     history = [[[] for _ in range(4)] for _ in range(NUM_ENVS)]  # the last N_STEP (obs, action) per seat
+     done, no_mask = np.zeros(NUM_ENVS, np.uint8), np.ones(fc.NUM_ACTIONS, bool)
+     start, env_steps, step, losses, games = time.time(), 0, 0, [], 0
+-    agent.save(out / "ckpt_0000000.pt", step=0, env_steps=0)
++    snapshots = last_snapshot = 0  # snapshots taken; league.games at the last one
++    if state:
++        agent.q.load_state_dict(state["q"])
++        target.load_state_dict(state["target"])
++        opt.load_state_dict(state["opt"])
++        league.load_state(state["league"], lambda id: pool_agent(out, id))
++        start -= state["elapsed"]
++        env_steps, step, snapshots, last_snapshot = (state[k] for k in ("env_steps", "step", "snapshots",
++                                                                        "last_snapshot"))
++        log(out, dict(resumed=resumes, hours=state["elapsed"] / 3600, env_steps=env_steps))
++    else:
++        agent.save(out / f"ckpt_{0:012d}.pt", step=0, env_steps=0)
++
++    def save_state():
++        save_resume(out, dict(resumes=resumes, elapsed=time.time() - start, env_steps=env_steps, step=step,
++                              snapshots=snapshots, last_snapshot=last_snapshot, q=agent.q.state_dict(),
++                              target=target.state_dict(), opt=opt.state_dict(), league=league.state()), league.ids)
++
++    save_state()
++    next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
++    last_monitor = last_resume = time.time()
+ 
+     while time.time() - start < hours * 3600:
+         step += 1
+-        agent.eps = max(EPS_END, 1 - env_steps / EPS_STEPS)
++        agent.eps = max(EPS_END, 1 - (time.time() - start) / (EPS_DECAY * hours * 3600))
+         obs, mask, seat, status = observe(env, NUM_ENVS)
+         rules.apply(mask, seat, status[:, 2])
+         mine = league.learner_rows(seat)
+@@ -149,33 +198,45 @@ def train(name, seed, hours, trades, config=None):
+             losses.append(loss.item())
+         if step % TARGET_EVERY == 0:
+             target.load_state_dict(agent.q.state_dict())
+-        if step % SNAPSHOT_EVERY == 0:
+-            frozen = copy.deepcopy(agent)
+-            frozen.eps = 0.02
+-            league.add(frozen)
++        if league.games - last_snapshot >= SNAPSHOT_EVERY:
++            snapshots, last_snapshot = snapshots + 1, league.games
++            agent.save(out / "pool" / f"{snapshots}.pt", step=step, env_steps=env_steps)
++            frozen = copy.copy(agent)  # the league makes the deep copy
++            frozen.eps = POOL_EPS
++            league.add(frozen, snapshots)
+         if step % LOG_EVERY == 0:
+             row = dict(step=step, env_steps=env_steps, hours=(time.time() - start) / 3600, games=games,
++                       total_games=league.games,
+                        eps=agent.eps, replay=replay.n, loss=float(np.mean(losses)) if losses else None,
+                        pool=len(league.pool), pool_winrate=float(np.mean(league.winrate)))
+             losses, games = [], 0
+-            if step % MONITOR_EVERY == 0:
++            if time.time() - last_monitor > MONITOR_EVERY:
+                 greedy = copy.deepcopy(agent)
+                 greedy.eps = 0.0
+                 row["vs_random"] = wins(play([greedy, rnd, greedy, rnd], 50, 10_000, trades), [0, 2]) / 50
+                 play([greedy] * 4, 2, 20_000, trades, log_path=out / "games" / f"step_{step:07d}.jsonl.gz")
++                last_monitor = time.time()
+             log(out, row)
+-        if step % CKPT_EVERY == 0:
+-            agent.save(out / f"ckpt_{step:07d}.pt", step=step, env_steps=env_steps)
++        if env_steps >= next_ckpt:  # kept for good, unlike the pool snapshots
++            agent.save(out / f"ckpt_{next_ckpt:012d}.pt", step=step, env_steps=env_steps)
++            next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
++        if time.time() - last_resume > RESUME_EVERY:
++            save_state()
++            last_resume = time.time()
+ 
+-    agent.save(out / f"ckpt_{step:07d}.pt", step=step, env_steps=env_steps)
++    agent.save(out / f"ckpt_{env_steps:012d}.pt", step=step, env_steps=env_steps)
++    save_state()  # --resume --hours <more> trains on
+ 
+ 
+ if __name__ == "__main__":
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("--name", required=True)
+     p.add_argument("--seed", type=int, default=1)
+-    p.add_argument("--hours", type=float, default=1.0, help="wall-clock training budget")
++    p.add_argument("--hours", type=float, help="wall-clock training budget (default 1); with --resume: a new total")
+     p.add_argument("--no-trades", action="store_true", help="block player trades for every seat")
+     p.add_argument("--config", help="JSON file overriding the constants above (e.g. hpsearch's best)")
++    p.add_argument("--resume", action="store_true",
++                   help="continue runs/<name>/ from resume.pt with its own settings, or start it if it is new")
+     args = p.parse_args()
+-    train(args.name, args.seed, args.hours, not args.no_trades, json.load(open(args.config)) if args.config else None)
++    train(args.name, args.seed, args.hours, not args.no_trades,
++          json.load(open(args.config)) if args.config else None, args.resume)
+diff --git a/evaluate.py b/evaluate.py
+index 0caf3fd..4f8e420 100644
+--- a/evaluate.py
++++ b/evaluate.py
+@@ -14,6 +14,10 @@ Rows are appended to results/eval.jsonl; --events saves one trade log per seatin
+ training step mean no cycling.
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
+ import importlib
+ import json
+@@ -36,7 +40,7 @@ def load(spec, seed=0):
+         from alphabeta import K, AlphaBeta
+ 
+         return AlphaBeta(k=int(spec.split(":")[1]) if ":" in spec else K, seed=seed)
+-    module, cls = AGENTS[torch.load(spec, map_location="cpu").get("algo", "ppo")]
++    module, cls = AGENTS[torch.load(spec, map_location="cpu", weights_only=True).get("algo", "ppo")]
+     return getattr(importlib.import_module(module), cls).load(spec)
+ 
+ 
+@@ -103,6 +107,7 @@ def main():
+     p.add_argument("--events", help="save trade event logs (<path>.A02.fcev, ...) for metrics.py")
+     args = p.parse_args()
+     trades_a, trades_b = args.trades_a == "on", args.trades_b == "on"
++    torch.manual_seed(args.seed)  # PPO samples its moves with torch's RNG
+ 
+     if args.mode == "vs":
+         a, b = load(args.agents[0], seed=1), load(args.agents[1], seed=2)
+diff --git a/hpsearch.py b/hpsearch.py
+index 237e8b4..38bdb3d 100644
+--- a/hpsearch.py
++++ b/hpsearch.py
+@@ -1,27 +1,65 @@
+-"""Hyperparameter search in two stages: short training runs, ranked by strength.
+-
+-    python hpsearch.py ppo --trials 16 --hours 0.5 [--parallel 2]   # stage 1: SPACE at the default size
+-    python hpsearch.py ppo --sizes --hours 1 [--parallel 2]         # stage 2: every WIDTH x DEPTH in SIZES
+-    python ppo.py --name ppo_best --hours 8 --config results/hpsearch_ppo_best.json
+-
+-Stage 1 trains the algorithm (ppo, dqn or az) with random draws from SPACE, every other constant
+-unchanged. Stage 2 trains the stage-1 winner once per network size in SIZES. Trades are on. Each
+-trial's last checkpoint then plays Alpha-Beta K=1 (2v2, trades off: the benchmark setting) and
+-random; trials are ranked by the per-seat win rate against Alpha-Beta, ties broken by the rate
+-against random. Rows go to results/hpsearch_<algo>.jsonl and the winning settings to
+-results/hpsearch_<algo>_best.json (after stage 2: the stage-1 settings plus the size).
+-
+-- The trials of a stage share one wall-clock budget, so short trials favour small, fast nets:
+-  give stage 2 more hours than stage 1.
+-- Stage 1 runs at the default size; a much bigger net may want a lower LR.
+-- Every trial uses the same seed, so confirm the winner with more seeds before trusting small
+-  differences.
++"""Hyperparameter search in two stages: equal-hours training runs, compared head to head.
++
++    python hpsearch.py ppo --search ppo-s1 --trials 16 --hours 1     # stage 1: SPACE at the default size
++    python hpsearch.py ppo --search ppo-s2 --sizes --hours 2         # stage 2: SIZES on the stage-1 winner
++    python hpsearch.py ppo --search ppo-s1 --report                  # only redo report.md and the figures
++    python ppo.py --name ppo_best --hours 72 --config results/hpsearch_ppo_best.json
++
++Protocol (the same for ppo, dqn and az):
++- Stage 1: trial 00 trains the hand-set defaults, trials 01.. random draws from SPACE (every other
++  constant unchanged, the default network size). Stage 2: the stage-1 winner at every size in
++  SIZES; trial 00 is the size it already had. P_SELFPLAY is fixed (0.8 in every trainer).
++- Every trial: --hours of training, trades on, seed TRIAL_SEED (the same boards and dice for all,
++  so differences come from the settings), one trial at a time (equal hours = equal compute).
++- Its final checkpoint then plays EVAL_GAMES games on the same boards (EVAL_SEED), 2v2 with the
++  seats swapped, against
++  * vs_ref:    the reference, trial 00's final checkpoint (trades on): head to head;
++  * vs_ab1:    Alpha-Beta K=1 with player trades off for every seat (the benchmark setting);
++  * vs_random: random (trades on);
++  as a per-seat win rate with a Wilson 95% interval (chance 0.25; truncated games count for
++  nobody). Then SELFPLAY_GAMES games against itself with trade logs give its trading: offers,
++  trades and acceptance per game, acceptance by the proposer's lead and the lead slope (metrics.py).
++- Ranking: by RANK_BY (vs_ref), then vs_ab1, then vs_random. Between agents this close, head to
++  head has the most statistical power; after short trials Alpha-Beta beats nearly every agent and
++  every agent beats random, so those two separate little. The winner's settings go to
++  results/hpsearch_<algo>_best.json (after stage 2: with its size).
++
++Files, all under results/hpsearch_<algo>_<search>/ (the data for the write-up):
++- plan.json     the protocol: constants above, SPACE or SIZES, every trial's config, the trainer
++                defaults, code commit (code.diff: uncommitted changes), versions and machine;
++- trials.jsonl  one row per finished trial: config, all settings, training totals, every
++                evaluation (rate, ci95, wins, games, seconds), trading statistics, score;
++- results.csv   the same as a flat table (for pgfplots or pandas);
++- report.md     protocol, search space and results tables, the winner, figure captions;
++- figures/      ranking, sensitivity (stage 1) or sizes and speed (stage 2), learning curves,
++                trading; each as .pdf (LaTeX) and .png.
++Each trial's run is runs/hp_<algo>_<search>_NN/: config.json, metrics.jsonl (the learning curve),
++ckpt_*.pt and the self-play trade logs selfplay.A02.fcev / .A13.fcev. Its pool/ and resume.pt are
++deleted after the evaluation to save disk.
++
++A search is resumable: after a crash, rerun the same command (same --search). Finished trials are
++skipped and an unfinished one continues from its resume.pt. The command exits non-zero if a trial
++failed, so `until python hpsearch.py ...; do sleep 60; done` retries it.
++
++Caveats for the write-up: the trials are short (the real runs take days), which favours settings
++that learn fast; one seed per trial, so confirm the winner with more seeds; league snapshots come
++every 20k games, so a short trial meets few of them (an AZ trial often none).
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
++import csv
+ import importlib
++import itertools
+ import json
+ import multiprocessing as mp
++import platform
++import shutil
++import subprocess
++import sys
+ import time
+ 
+ import numpy as np
+@@ -31,17 +69,18 @@ from evaluate import load, match, per_seat
+ 
+ MODULES = {"ppo": "ppo", "dqn": "dqn", "az": "alphazero"}
+ SPACE = {  # ("log", lo, hi) = log-uniform, a tuple of values = one of them
+-    "ppo": dict(LR=("log", 1e-4, 1e-3), ENT_COEF=("log", 1e-3, 3e-2), GAMMA=(0.995, 0.999, 0.9995),
+-                LAMBDA=(0.9, 0.95, 0.98), CLIP=(0.1, 0.2, 0.3), EPOCHS=(2, 4, 8), NUM_ENVS=(128, 256, 512),
+-                P_SELFPLAY=(0.3, 0.5, 0.8)),
+-    "dqn": dict(LR=("log", 3e-5, 1e-3), N_STEP=(3, 5, 10), GAMMA=(0.995, 0.999),
+-                EPS_STEPS=(2_000_000, 5_000_000, 10_000_000), TARGET_EVERY=(500, 2_000, 5_000),
+-                BATCH=(256, 512, 1024), P_SELFPLAY=(0.3, 0.5, 0.8)),
+-    "az": dict(N_SIMS=(16, 32, 64), C_PUCT=(1.0, 1.5, 2.5), LR=("log", 3e-4, 3e-3), REPLAY_RATIO=(2, 4, 8),
+-               TOP_K=(8, 16), P_SELFPLAY=(0.5, 0.8, 1.0)),
++    "ppo": dict(LR=("log", 3e-5, 3e-4), ENT_COEF=("log", 1e-3, 3e-2), GAMMA=(0.995, 0.999, 0.9995),
++                LAMBDA=(0.9, 0.95, 0.98), CLIP=(0.1, 0.2, 0.3), EPOCHS=(2, 4, 8), NUM_ENVS=(512, 1024, 2048)),
++    "dqn": dict(LR=("log", 1e-5, 3e-4), N_STEP=(3, 5, 10), GAMMA=(0.995, 0.999), EPS_DECAY=(0.01, 0.02, 0.05),
++                TARGET_EVERY=(500, 2_000, 5_000), BATCH=(256, 512, 1024), TRAIN_EVERY=(1, 2, 4)),
++    "az": dict(N_SIMS=(16, 32, 64), C_PUCT=(1.0, 1.5, 2.5), LR=("log", 1e-4, 1e-3), REPLAY_RATIO=(2, 4, 8),
++               TOP_K=(8, 16)),
+ }
+-SIZES = dict(WIDTH=(256, 512, 1024), DEPTH=(2, 3, 5, 7))  # stage 2: every combination
+-EVAL_GAMES, EVAL_SEED, TRIAL_SEED = 400, 7_000, 1
++SIZES = dict(WIDTH=(1024, 2048), DEPTH=(3, 5, 7))  # stage 2: every combination, large nets only
++EVAL_GAMES, SELFPLAY_GAMES, EVAL_SEED, TRIAL_SEED = 400, 200, 7_000, 1
++RANK_BY = "vs_ref"  # the ranking score: "vs_ref" or "vs_ab1"
++EVALS = {"vs_ref": "the reference (trial 00), trades on", "vs_ab1": "Alpha-Beta K=1, player trades off",
++         "vs_random": "random, trades on"}
+ 
+ 
+ def draw(space, rng):
+@@ -49,55 +88,424 @@ def draw(space, rng):
+             else v[int(rng.integers(len(v)))] for k, v in space.items()}
+ 
+ 
++def make_plan(algo, search, stage, trials, hours, seed, out):
++    """Every trial's config, and the protocol, versions and machine of this search."""
++    import fastcatan as fc
++    import torch
++
++    module = importlib.import_module(MODULES[algo])
++    defaults = {k: v for k, v in vars(module).items() if k.isupper() and isinstance(v, (int, float))}
++    if stage == 2:
++        best = ROOT / "results" / f"hpsearch_{algo}_best.json"
++        if not best.exists():
++            raise SystemExit(f"{best} is missing: run stage 1 first")
++        base = json.loads(best.read_text())
++        first = (base.get("WIDTH", defaults["WIDTH"]), base.get("DEPTH", defaults["DEPTH"]))
++        sizes = [first] + [s for s in itertools.product(SIZES["WIDTH"], SIZES["DEPTH"]) if s != first]
++        configs = [dict(base, WIDTH=w, DEPTH=d) for w, d in sizes]
++    else:
++        rng = np.random.default_rng(seed)
++        configs = [{}] + [draw(SPACE[algo], rng) for _ in range(trials - 1)]
++
++    def git(*args):
++        return subprocess.run(["git", "-C", str(ROOT), *args], capture_output=True, text=True).stdout
++
++    dirty = bool(git("status", "--porcelain", "--untracked-files=no").strip())
++    if dirty:
++        (out / "code.diff").write_text(git("diff", "HEAD"))
++    return dict(algo=algo, search=search, stage=stage, hours=hours, trials=len(configs), configs=configs,
++                space=SIZES if stage == 2 else SPACE[algo], defaults=defaults, rank_by=RANK_BY, evals=EVALS,
++                eval_games=EVAL_GAMES, selfplay_games=SELFPLAY_GAMES, eval_seed=EVAL_SEED, trial_seed=TRIAL_SEED,
++                draw_seed=seed, created=time.strftime("%Y-%m-%d %H:%M"),
++                code=dict(commit=git("rev-parse", "HEAD").strip(), dirty=dirty),
++                versions=dict(fastcatan=fc.__version__, torch=torch.__version__, python=platform.python_version()),
++                machine=dict(host=platform.node(), cpus=os.cpu_count(),
++                             gpu=torch.cuda.get_device_name() if torch.cuda.is_available() else None))
++
++
+ def trial(algo, search, i, config, hours):
+-    """Train one setting, evaluate its last checkpoint, append the result row."""
++    """Train trial i (or continue it after a crash), evaluate its final checkpoint, append its row."""
++    import torch
++
++    from metrics import summarize
++
++    out = ROOT / "results" / f"hpsearch_{algo}_{search}"
+     name = f"hp_{algo}_{search}_{i:02d}"
+-    importlib.import_module(MODULES[algo]).train(name, TRIAL_SEED, hours, True, config)
+-    ckpt = str(sorted((ROOT / "runs" / name).glob("ckpt_*.pt"))[-1])
+-    agent = load(ckpt)
+-    ab, rnd = match(agent, load("ab:1"), EVAL_GAMES, EVAL_SEED, False, False), match(agent, load("random"), EVAL_GAMES, EVAL_SEED)
+-    row = dict(algo=algo, search=search, trial=i, config=config, hours=hours, ckpt=ckpt,
+-               vs_ab1=per_seat(ab[0], ab[3])[0], vs_random=per_seat(rnd[0], rnd[3])[0])
+-    with open(ROOT / "results" / f"hpsearch_{algo}.jsonl", "a") as f:
++    run = ROOT / "runs" / name
++    t = time.time()
++    importlib.import_module(MODULES[algo]).train(name, TRIAL_SEED, hours, True, config, resume=True)
++    wall = time.time() - t
++
++    def final(run_name):
++        return str(sorted((ROOT / "runs" / run_name).glob("ckpt_*.pt"))[-1])
++
++    torch.manual_seed(EVAL_SEED)
++    agent = load(final(name), seed=1)
++    ref = agent if i == 0 else load(final(f"hp_{algo}_{search}_00"), seed=2)
++    evals = {}
++    for key, opponent, trades in (("vs_ref", ref, True), ("vs_ab1", load("ab:1", seed=3), False),
++                                  ("vs_random", load("random", seed=4), True)):
++        t = time.time()
++        a_wins, b_wins, truncated, games = match(agent, opponent, EVAL_GAMES, EVAL_SEED, trades, trades)
++        rate, ci = per_seat(a_wins, games)
++        evals[key] = dict(rate=rate, ci95=list(ci), wins=a_wins, opponent_wins=b_wins, truncated=truncated,
++                          games=games, seconds=round(time.time() - t))
++    t = time.time()
++    for log in run.glob("selfplay.*.fcev"):  # a trial that crashed during its evaluation
++        log.unlink()
++    match(agent, agent, SELFPLAY_GAMES, EVAL_SEED + 1, events=run / "selfplay.fcev", labels=(name, name))
++    stats = summarize(sorted(run.glob("selfplay.A*.fcev")), name)
++    trading = {k: stats[k] for k in ("games", "offers_per_game", "trades_per_game", "accept_rate", "accept_by_lead",
++                                     "lead_slope", "offers_per_turn_by_lead", "offer_terms_by_lead",
++                                     "trade_terms_by_lead", "reciprocity")}
++    trading["seconds"] = round(time.time() - t)
++
++    last = [r for r in map(json.loads, open(run / "metrics.jsonl")) if "total_games" in r][-1]
++    settings = {k: v for k, v in json.loads((run / "config.json").read_text()).items() if k.isupper()}
++    row = dict(algo=algo, search=search, trial=i, name=name, config=config, settings=settings, hours=hours,
++               ckpt=final(name), score=evals[RANK_BY]["rate"], eval=evals, trading=trading,
++               training=dict(env_steps=last["env_steps"], games=last["total_games"], hours=last["hours"],
++                             env_steps_per_s=last["env_steps"] / max(1e-9, last["hours"] * 3600),
++                             wall_seconds=round(wall)))
++    with open(out / "trials.jsonl", "a") as f:
+         f.write(json.dumps(row) + "\n")
+-    print(f"trial {i}: vs AB {row['vs_ab1']:.3f}  vs random {row['vs_random']:.3f}  {config}", flush=True)
++    shutil.rmtree(run / "pool", ignore_errors=True)  # not needed any more: save the disk
++    (run / "resume.pt").unlink(missing_ok=True)
++    e = {k: v["rate"] for k, v in evals.items()}
++    print(f"trial {i:02d}: vs ref {e['vs_ref']:.3f}  vs AB {e['vs_ab1']:.3f}  vs random {e['vs_random']:.3f}  "
++          f"trades/game {trading['trades_per_game']}  {config}", flush=True)
++
++
++def finished(out):
++    path = out / "trials.jsonl"
++    return [json.loads(line) for line in open(path)] if path.exists() else []
++
++
++def ranked(rows):
++    order = [RANK_BY] + [k for k in EVALS if k != RANK_BY]
++    return sorted(rows, key=lambda r: [r["eval"][k]["rate"] for k in order], reverse=True)
+ 
+ 
+ def main():
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("algo", choices=list(MODULES))
+-    p.add_argument("--trials", type=int, default=16, help="stage 1 only")
+-    p.add_argument("--sizes", action="store_true", help="stage 2: every network size on the stage-1 winner")
+-    p.add_argument("--hours", type=float, default=0.5, help="training budget per trial")
+-    p.add_argument("--parallel", type=int, default=1, help="trials at the same time (they share the GPU)")
++    p.add_argument("--search", help="name of the search (default: a timestamp); rerun with it to continue")
++    p.add_argument("--sizes", action="store_true", help="stage 2: every size in SIZES on the stage-1 winner")
++    p.add_argument("--trials", type=int, default=16, help="stage 1: trial 00 (the defaults) plus trials-1 draws")
++    p.add_argument("--hours", type=float, default=1.0, help="training budget per trial")
++    p.add_argument("--parallel", type=int, default=1,
++                   help="trials at the same time after trial 00 (they share the GPU: equal hours, unequal compute)")
+     p.add_argument("--seed", type=int, default=0, help="seed of the random draws")
++    p.add_argument("--report", action="store_true", help="only (re)write report.md and the figures of --search")
+     args = p.parse_args()
+-    (ROOT / "results").mkdir(exist_ok=True)
+-    search, rng = time.strftime("%Y%m%d-%H%M%S"), np.random.default_rng(args.seed)
+-    best = ROOT / "results" / f"hpsearch_{args.algo}_best.json"
+-    if args.sizes:
+-        if not best.exists():
+-            p.error(f"{best} is missing: run stage 1 first")
+-        base = json.loads(best.read_text())
+-        configs = [dict(base, WIDTH=w, DEPTH=d) for w in SIZES["WIDTH"] for d in SIZES["DEPTH"]]
++    if args.report and not args.search:
++        p.error("--report needs --search")
++    search = args.search or time.strftime("%Y%m%d-%H%M%S")
++    out = ROOT / "results" / f"hpsearch_{args.algo}_{search}"
++    if args.report:
++        return report(out)
++
++    stage = 2 if args.sizes else 1
++    if (out / "plan.json").exists():
++        plan = json.loads((out / "plan.json").read_text())
++        if (plan["stage"], plan["hours"]) != (stage, args.hours):
++            p.error(f"{out.name} is a stage-{plan['stage']} search with {plan['hours']} h trials")
++        print(f"continuing {out.name}: {len(finished(out))} of {plan['trials']} trials done", flush=True)
+     else:
+-        configs = [draw(SPACE[args.algo], rng) for _ in range(args.trials)]
++        out.mkdir(parents=True)
++        plan = make_plan(args.algo, search, stage, args.trials, args.hours, args.seed, out)
++        (out / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
++    configs, done = plan["configs"], {r["trial"] for r in finished(out)}
++    todo = [i for i in range(len(configs)) if i not in done]
++    rest = [i for i in todo if i != 0]
++    batches = ([[0]] if 0 in todo else []) + [rest[k:k + args.parallel] for k in range(0, len(rest), args.parallel)]
+ 
+-    ctx = mp.get_context("spawn")  # each trial in its own process (AZ trials start their own actors)
+-    for first in range(0, len(configs), args.parallel):
+-        procs = [ctx.Process(target=trial, args=(args.algo, search, i, configs[i], args.hours))
+-                 for i in range(first, min(first + args.parallel, len(configs)))]
+-        for proc in procs:
++    ctx, failed = mp.get_context("spawn"), []  # each trial in its own process (AZ trials start their own actors)
++    for batch in batches:
++        procs = {i: ctx.Process(target=trial, args=(args.algo, search, i, configs[i], plan["hours"])) for i in batch}
++        for proc in procs.values():
+             proc.start()
+-        for proc in procs:
++        for i, proc in procs.items():
+             proc.join()
++            if proc.exitcode != 0:
++                failed.append(i)
++        if 0 in failed:
++            break  # every other trial is evaluated against trial 00
+ 
+-    rows = [r for r in map(json.loads, open(ROOT / "results" / f"hpsearch_{args.algo}.jsonl")) if r["search"] == search]
+-    rows.sort(key=lambda r: (r["vs_ab1"], r["vs_random"]), reverse=True)
+-    for r in rows:
+-        print(f"vs AB {r['vs_ab1']:.3f}  vs random {r['vs_random']:.3f}  {r['config']}")
++    rows = ranked(finished(out))
++    for rank, r in enumerate(rows, 1):
++        e = r["eval"]
++        print(f"{rank:2d}. trial {r['trial']:02d}  vs ref {e['vs_ref']['rate']:.3f}  vs AB {e['vs_ab1']['rate']:.3f}  "
++              f"vs random {e['vs_random']['rate']:.3f}  {r['config']}")
++    if failed:
++        sys.exit(f"trials {failed} failed (tracebacks above); rerun with --search {search} to retry them")
++    best = ROOT / "results" / f"hpsearch_{args.algo}_best.json"
+     best.write_text(json.dumps(rows[0]["config"], indent=2) + "\n")
+-    print(f"best settings -> {best}")
++    print(f"best settings (trial {rows[0]['trial']:02d}) -> {best}")
++    try:
++        report(out)
++    except Exception as e:  # never fail a finished search over its figures; --report redoes them
++        print(f"report failed ({e!r}); fix it, then run with --report", flush=True)
++
++
++# --- report: tables and figures for the write-up ---------------------------------------------
++
++INK, INK_2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
++BLUE, ORANGE = "#2a78d6", "#eb6834"  # categorical slots 1 and 2 (validated together, light mode)
++RAMP = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]  # sequential blue
++NAMES = {"vs_ref": "vs reference (trial 00)", "vs_ab1": "vs Alpha-Beta K=1", "vs_random": "vs random",
++         "env_steps": "env steps (millions)", "steps_per_turn": "decisions per turn", "pg_loss": "policy loss",
++         "p_loss": "policy loss", "v_loss": "value loss", "loss": "TD loss", "entropy": "policy entropy",
++         "pool_winrate": "win share vs league"}
++CURVES = ("env_steps", "steps_per_turn", "pg_loss", "p_loss", "loss", "v_loss", "entropy", "pool_winrate")
++
++
++def label(r):
++    return f"{r['trial']:02d}" + (" (reference)" if r["trial"] == 0 else "")
++
++
++def changed(r, plan):
++    """The settings of trial r that differ from the trainer defaults, short."""
++    return ", ".join(f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}" for k, v in r["config"].items()
++                     if v != plan["defaults"].get(k)) or "defaults"
++
++
++def interval(e):
++    return f"{e['rate']:.3f} [{e['ci95'][0]:.3f}, {e['ci95'][1]:.3f}]"
++
++
++def report(out):
++    """report.md, results.csv and figures/ from a search's plan.json and trials.jsonl."""
++    import matplotlib
++
++    matplotlib.use("Agg")
++    import matplotlib.pyplot as plt
++    from matplotlib.colors import LinearSegmentedColormap, Normalize
++    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
++
++    plan, rows = json.loads((out / "plan.json").read_text()), ranked(finished(out))
++    if not rows:
++        return print(f"{out.name}: no finished trials yet")
++    figs = out / "figures"
++    figs.mkdir(exist_ok=True)
++    plt.rcParams.update({"font.size": 8, "axes.titlesize": 8, "axes.labelsize": 8, "xtick.labelsize": 7,
++                         "ytick.labelsize": 7, "legend.fontsize": 7, "axes.edgecolor": INK_2, "axes.labelcolor": INK,
++                         "text.color": INK, "xtick.color": INK_2, "ytick.color": INK_2, "axes.grid": True,
++                         "grid.color": GRID, "grid.linewidth": 0.6, "axes.spines.top": False,
++                         "axes.spines.right": False, "axes.axisbelow": True, "legend.frameon": False,
++                         "pdf.fonttype": 42, "savefig.bbox": "tight", "savefig.dpi": 200,
++                         "figure.constrained_layout.use": True})
++    cmap = LinearSegmentedColormap.from_list("blue", RAMP)
++    key, short = plan["rank_by"], NAMES[plan["rank_by"]].split(" (")[0]
++    ref = next((r for r in rows if r["trial"] == 0), None)
++    written = []
++
++    def save(fig, name, caption):
++        for ext in ("pdf", "png"):
++            fig.savefig(figs / f"{name}.{ext}")
++        plt.close(fig)
++        written.append((name, caption))
++
++    def errorbars(ax, x, y, lo, hi, color, horizontal=False, **kw):
++        err = [np.subtract(y, lo), np.subtract(hi, y)]
++        xy, bars = ((y, x), {"xerr": err}) if horizontal else ((x, y), {"yerr": err})
++        ax.errorbar(*xy, **bars, fmt="o", color=color, ms=4.5, elinewidth=1.4, capsize=0, mec="white", mew=0.8, **kw)
++
++    def chance(ax, vertical=False):
++        (ax.axvline if vertical else ax.axhline)(0.25, color=INK_2, lw=0.8, ls=(0, (3, 3)))
++
++    # 1. Ranking: every trial's three evaluations, sorted by the ranking score.
++    y = np.arange(len(rows))[::-1]
++    fig, axes = plt.subplots(1, 3, figsize=(7, 0.8 + 0.22 * len(rows)), sharey=True)
++    for ax, opponent in zip(axes, EVALS):
++        e = [r["eval"][opponent] for r in rows]
++        errorbars(ax, y, [v["rate"] for v in e], [v["ci95"][0] for v in e], [v["ci95"][1] for v in e], BLUE,
++                  horizontal=True)
++        chance(ax, vertical=True)
++        ax.set(xlim=(0, 0.5), title=NAMES[opponent], xlabel="per-seat win rate")
++        ax.grid(axis="y", visible=False)
++    axes[0].set_yticks(y, [label(r) for r in rows])
++    axes[0].set_ylabel("trial (best first)")
++    save(fig, "ranking", f"Per-seat win rate of every trial's final checkpoint after {plan['hours']} h of training "
++         f"({plan['eval_games']} games each, 2v2 with seats swapped, Wilson 95% intervals; dashed: chance 0.25). "
++         f"Trials are sorted by {NAMES[key]}.")
++
++    score = np.array([r["score"] for r in rows])
++    ci = np.array([r["eval"][key]["ci95"] for r in rows])
++    if plan["stage"] == 1:  # 2. Sensitivity: the score against each searched setting.
++        names = list(plan["space"])
++        cols = 4 if len(names) > 6 else 3
++        n_rows = -(-len(names) // cols)
++        fig, axes = plt.subplots(n_rows, cols, figsize=(7, 1.9 * n_rows), sharey=True, squeeze=False)
++        is_ref = np.array([r["trial"] == 0 for r in rows])
++        for ax, name in zip(axes.flat, names):
++            spec, values = plan["space"][name], [r["settings"][name] for r in rows]
++            if spec[0] == "log":
++                x = np.array(values, float)
++                ax.set_xscale("log")
++                ax.xaxis.set_major_locator(LogLocator(subs=(1.0, 3.0)))
++                ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
++                ax.xaxis.set_minor_formatter(NullFormatter())
++            else:  # categories, with a little jitter so equal values stay visible
++                cats = sorted(set(map(float, spec)) | {float(plan["defaults"][name])})
++                x = np.array([cats.index(float(v)) for v in values]) + np.linspace(-0.12, 0.12, len(rows))
++                ax.set_xticks(range(len(cats)), [f"{c:g}" for c in cats])
++                ax.set_xlim(-0.5, len(cats) - 0.5)
++            errorbars(ax, x[~is_ref], score[~is_ref], ci[~is_ref, 0], ci[~is_ref, 1], BLUE, label="random draw")
++            errorbars(ax, x[is_ref], score[is_ref], ci[is_ref, 0], ci[is_ref, 1], ORANGE, label="defaults (trial 00)")
++            chance(ax)
++            ax.set_title(name)
++        for ax in axes.flat[len(names):]:
++            ax.set_visible(False)
++        for ax in axes[:, 0]:
++            ax.set_ylabel(f"win rate {short}")
++        spare = axes.flat[len(names)] if len(names) < axes.size else None
++        if spare is not None:  # the legend in the empty slot, else above the panels
++            spare.set_visible(True)
++            spare.axis("off")
++            spare.legend(*axes.flat[0].get_legend_handles_labels(), loc="center")
++        else:
++            fig.legend(*axes.flat[0].get_legend_handles_labels(), loc="outside upper left", ncol=2)
++        save(fig, "sensitivity", f"Ranking score ({NAMES[key]}, per seat, Wilson 95%) against each searched "
++             "setting. Orange: the hand-set defaults (trial 00), the reference that every trial plays.")
++    else:  # 2. Sizes: score and speed over width x depth.
++        widths, depths = sorted(plan["space"]["WIDTH"]), sorted(plan["space"]["DEPTH"])
++        panels = (("sizes", lambda r: r["score"], f"win rate {NAMES[key]}",
++                   lambda r: f"{r['score']:.3f}\n[{r['eval'][key]['ci95'][0]:.3f}, {r['eval'][key]['ci95'][1]:.3f}]"),
++                  ("speed", lambda r: r["training"]["env_steps_per_s"] / 1e3, "env steps per second (thousands)",
++                   lambda r: f"{r['training']['env_steps_per_s'] / 1e3:.0f}k"))
++        for name, value, title, text in panels:
++            grid, cells = np.full((len(depths), len(widths)), np.nan), {}
++            for r in rows:
++                j, k = depths.index(r["settings"]["DEPTH"]), widths.index(r["settings"]["WIDTH"])
++                grid[j, k], cells[j, k] = value(r), text(r)
++            fig, ax = plt.subplots(figsize=(1.2 + 1.3 * len(widths), 0.6 + 0.7 * len(depths)))
++            norm = Normalize(np.nanmin(grid), np.nanmax(grid) + 1e-9)
++            im = ax.imshow(grid, cmap=cmap, norm=norm, aspect="auto", origin="lower")
++            for (j, k), s in cells.items():
++                ax.text(k, j, s, ha="center", va="center", fontsize=6.5,
++                        color="white" if norm(grid[j, k]) > 0.55 else INK)
++            ax.set_xticks(range(len(widths)), widths)
++            ax.set_yticks(range(len(depths)), depths)
++            ax.set(xlabel="width (units per layer)", ylabel="depth (hidden layers)", title=title)
++            ax.grid(False)
++            fig.colorbar(im, ax=ax, shrink=0.85)
++            save(fig, name, f"{title[0].upper() + title[1:]} after {plan['hours']} h of training, by network size "
++                 "(the stage-1 winner's settings).")
++
++    # 3. Learning curves, each trial colored by its final score.
++    curves = {r["trial"]: [c for c in map(json.loads, open(ROOT / "runs" / r["name"] / "metrics.jsonl"))
++                           if "resumed" not in c] for r in rows}
++    metrics = [m for m in CURVES if any(m in c for cs in curves.values() for c in cs)]
++    norm = Normalize(score.min(), score.max() + 1e-9)
++    cols = min(3, len(metrics))
++    fig, axes = plt.subplots(-(-len(metrics) // cols), cols, figsize=(7, 2.0 * -(-len(metrics) // cols)),
++                             squeeze=False)
++    for ax in axes.flat[len(metrics):]:
++        ax.set_visible(False)
++    for ax, metric in zip(axes.flat, metrics):
++        for r in sorted(rows, key=lambda r: r["score"]):  # the best drawn last, on top
++            pts = [(c["hours"], c[metric]) for c in curves[r["trial"]] if c.get(metric) is not None
++                   and (metric != "steps_per_turn" or c.get("games"))]  # no finished game yet: no value
++            if not pts:
++                continue
++            h, v = np.array(pts, float).T
++            idx = np.digitize(h, np.linspace(0, h.max(), 41))  # time bins: per-update rows are noisy
++            hb = np.array([h[idx == b].mean() for b in np.unique(idx)])
++            vb = np.array([v[idx == b].mean() for b in np.unique(idx)]) / (1e6 if metric == "env_steps" else 1)
++            ax.plot(hb, vb, color=cmap(norm(r["score"])), lw=1.1)
++        ax.set(title=NAMES[metric], xlabel="hours")
++    fig.colorbar(plt.cm.ScalarMappable(norm, cmap), ax=axes, shrink=0.8, label="final score")
++    save(fig, "curves", f"Training curves of every trial (time-binned means), colored by its final ranking score "
++         f"({NAMES[key]}): darker is better.")
++
++    # 4. Trading in self-play: how much the agents trade, and acceptance by the proposer's lead.
++    fig, (a, b) = plt.subplots(1, 2, figsize=(7, 2.3))
++    errorbars(a, [r["trading"]["trades_per_game"] for r in rows], score, ci[:, 0], ci[:, 1], BLUE)
++    chance(a)
++    a.set(xlabel="trades per game in self-play", ylabel=f"win rate {short}", title="trading and strength")
++    leads = np.arange(-3, 4)
++    shown = [(rows[0], BLUE, -0.08, "best")] + ([(ref, ORANGE, 0.08, "reference")] if ref and ref is not rows[0] else [])
++    for r, color, offset, role in shown:
++        cells = [r["trading"]["accept_by_lead"].get(str(d)) for d in leads]
++        ok = np.array([c is not None for c in cells])
++        if ok.any():
++            v = np.array([c for c in cells if c is not None])
++            b.plot(leads[ok] + offset, v[:, 0], color=color, lw=1, alpha=0.6)
++            errorbars(b, leads[ok] + offset, v[:, 0], v[:, 1], v[:, 2], color, label=f"trial {r['trial']:02d} ({role})")
++    b.set(xlabel="proposer's lead (VP over the best other seat)", ylabel="acceptance rate", xticks=leads,
++          title="willingness to trade with the leader")
++    low, high = b.get_ylim()
++    b.set_ylim(low, high + 0.3 * (high - low))  # room for the legend above the points
++    b.legend(loc="upper left", ncol=2)
++    save(fig, "trading", f"Left: ranking score against trades per game ({plan['selfplay_games']} self-play games per "
++         "trial). Right: share of offers accepted by the proposer's lead, for the best trial and the reference "
++         "(Wilson 95%); a falling line means the leader is frozen out.")
++
++    # results.csv: one flat row per trial.
++    fields = ["rank", "trial", "changed"] + [f"{k}{s}" for k in EVALS for s in ("", "_lo", "_hi")] + [
++        "env_steps", "env_steps_per_s", "games", "offers_per_game", "trades_per_game", "accept_rate", "lead_slope"]
++    with open(out / "results.csv", "w", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(fields + list(plan["defaults"]))
++        for rank, r in enumerate(rows, 1):
++            t, s = r["trading"], r["training"]
++            w.writerow([rank, r["trial"], changed(r, plan)]
++                       + [x for k in EVALS for x in (r["eval"][k]["rate"], *r["eval"][k]["ci95"])]
++                       + [s["env_steps"], round(s["env_steps_per_s"]), s["games"], t["offers_per_game"],
++                          t["trades_per_game"], (t["accept_rate"] or [None])[0], (t["lead_slope"] or [None])[0]]
++                       + [r["settings"].get(k) for k in plan["defaults"]])
++
++    # report.md
++    best = rows[0]
++    m, c, v = plan["machine"], plan["code"], plan["versions"]
++    reference = ("the hand-set defaults; the others are random draws from the search space (seed "
++                 f"{plan['draw_seed']})" if plan["stage"] == 1 else
++                 "the stage-1 winner at its own size; the others are the same settings at every other size")
++    lines = [f"# Hyperparameter search: {plan['algo'].upper()}, stage {plan['stage']} (`{plan['search']}`)", "",
++             f"Started {plan['created']}; {len(rows)} of {plan['trials']} trials finished. Code {c['commit'][:10]}"
++             + (" with uncommitted changes (`code.diff`)" if c["dirty"] else "")
++             + f"; fastCatan {v['fastcatan']}, torch {v['torch']}; {m['gpu']}, {m['cpus']} CPUs (`{m['host']}`).", "",
++             "## Protocol", "",
++             f"- {plan['trials']} trials of {plan['hours']} h of training each, one at a time, trades on, seed "
++             f"{plan['trial_seed']} for every trial. League snapshots every {plan['defaults']['SNAPSHOT_EVERY']:,} "
++             f"games, self-play share P_SELFPLAY = {plan['defaults']['P_SELFPLAY']}.",
++             f"- Trial 00 is the reference: {reference}.",
++             f"- Each final checkpoint plays {plan['eval_games']} games on the same boards (seed {plan['eval_seed']}), "
++             "2v2 with the seats swapped, against " + "; ".join(plan["evals"].values())
++             + ". Per-seat win rate with a Wilson 95% interval (chance 0.25; truncated games count for nobody).",
++             f"- Trading: {plan['selfplay_games']} games of each agent against itself, with trade logs (metrics.py).",
++             f"- Ranking by {NAMES[key]}, ties broken by the other two.", "",
++             "## Search space", "", "| setting | default | searched |", "|---|---|---|"]
++    for name, spec in plan["space"].items():
++        searched = f"log-uniform {spec[1]:g} to {spec[2]:g}" if spec[0] == "log" else ", ".join(f"{x:g}" for x in spec)
++        lines.append(f"| {name} | {plan['defaults'][name]:g} | {searched} |")
++    lines += ["", "## Results", "",
++              "| rank | trial | settings | vs reference | vs AB K=1 | vs random | env steps | steps/s | games | "
++              "trades/game | acceptance |", "|---|---|---|---|---|---|---|---|---|---|---|"]
++    for rank, r in enumerate(rows, 1):
++        t, s = r["trading"], r["training"]
++        lines.append(f"| {rank} | {label(r)} | {changed(r, plan)} | " + " | ".join(interval(r["eval"][k]) for k in EVALS)
++                     + f" | {s['env_steps'] / 1e6:.0f}M | {s['env_steps_per_s'] / 1e3:.0f}k | {s['games']:,} | "
++                     f"{t['trades_per_game']} | {(t['accept_rate'] or ['-'])[0]} |")
++    verdict = ("The reference itself ranks first." if best["trial"] == 0 else
++               "Its interval lies above 0.25: it beats the reference." if best["eval"][key]["ci95"][0] > 0.25 else
++               "Its interval includes 0.25: with these games it is not distinguishable from the reference.")
++    lines += ["", f"**Winner: trial {best['trial']:02d}** ({changed(best, plan)}), {NAMES[key]} "
++              f"{interval(best['eval'][key])}. {verdict}"]
++    if ref and best is not ref:
++        lines.append(f"Against Alpha-Beta K=1: winner {interval(best['eval']['vs_ab1'])}, reference "
++                     f"{interval(ref['eval']['vs_ab1'])}.")
++    lines += ["", "## Figures", ""] + [f"![{n}](figures/{n}.png)\n\n*{cap}* (`figures/{n}.pdf`)\n" for n, cap in written]
++    lines += ["## Data", "",
++              "- `plan.json`: the protocol, every trial's config, trainer defaults, versions, machine.",
++              "- `trials.jsonl`: one row per trial (`eval.<opponent>.rate / ci95 / wins / games`, `trading.*`, "
++              "`training.*`, `settings`).",
++              "- `results.csv`: the results table, flat, with every setting.",
++              f"- `runs/hp_{plan['algo']}_{plan['search']}_NN/metrics.jsonl`: each trial's learning curve; "
++              "`selfplay.A*.fcev`: its self-play trade logs (`metrics.py` reads them).", ""]
++    (out / "report.md").write_text("\n".join(lines))
++    print(f"report -> {out / 'report.md'} ({len(written)} figures)", flush=True)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/league.py b/league.py
+index f45c73c..2f37bc4 100644
+--- a/league.py
++++ b/league.py
+@@ -2,7 +2,10 @@
+ 
+ Each game slot gets a lineup when its game starts. With probability p_selfplay the learner
+ plays all four seats; otherwise it plays seats {0,2} or {1,3} against one pool opponent.
+-Only the learner's seats are trained on.
++Only the learner's seats are trained on. Every trainer adds a snapshot each SNAPSHOT_EVERY
++finished games (`games`), so the pools of the algorithms are comparable per game played.
++Each snapshot has an id; its weights are in <run>/pool/<id>.pt while it is in the pool, so a
++resumed run (and every AlphaZero actor) can rebuild the pool from `ids`.
+ """
+ 
+ import copy
+@@ -18,21 +21,47 @@ class League:
+         self.rng = np.random.default_rng(seed)
+         self.n, self.p_selfplay, self.size = n, p_selfplay, size
+         self.pool = [RandomAgent(seed)]  # entry 0 is the random anchor and is never evicted
++        self.ids = [None]  # snapshot id of each entry (None: the random anchor)
+         self.winrate = [0.5]  # EMA of the learner's win share against each pool entry
+         self.opponent = np.full(n, -1)  # pool entry per game slot, -1 = pure self-play
+         self.learner = np.ones((n, 4), bool)  # the learner's seats per game slot
++        self.games = 0  # finished games so far, every lineup
+         for i in range(n):
+             self.assign(i)
+ 
+-    def add(self, agent):
+-        """Freeze a copy of the learner into the pool; a random entry goes when it is full."""
+-        if len(self.pool) < self.size:
++    def add(self, agent, id=None):
++        """Freeze a copy of the learner into the pool as snapshot `id`; a random entry goes when it is full."""
++        j = len(self.pool) if len(self.pool) < self.size else int(self.rng.integers(1, self.size))
++        self.put(j, copy.deepcopy(agent), id)
++
++    def put(self, j, agent, id):
++        """Entry j (or a new last entry) becomes `agent`, with fresh PFSP statistics."""
++        if j == len(self.pool):
+             self.pool.append(None)
++            self.ids.append(None)
+             self.winrate.append(0.5)
+-            j = len(self.pool) - 1
+-        else:
+-            j = int(self.rng.integers(1, self.size))
+-        self.pool[j], self.winrate[j] = copy.deepcopy(agent), 0.5
++        self.pool[j], self.ids[j], self.winrate[j] = agent, id, 0.5
++
++    def sync(self, ids, load):
++        """Hold the snapshots `ids`, entry by entry: after a resume, and in AlphaZero actors (the
++        learner picks their pool). load(id) gives the agent of snapshot `id`, or None if its file
++        is gone; the remaining entries then wait for the next sync."""
++        for j, id in enumerate(ids):
++            if j < len(self.ids) and self.ids[j] == id:
++                continue
++            agent = load(id)
++            if agent is None:
++                return
++            self.put(j, agent, id)
++
++    def state(self):
++        return dict(ids=list(self.ids), winrate=list(self.winrate), games=self.games)
++
++    def load_state(self, state, load):
++        """Restore a state() (load as in sync)."""
++        self.sync(state["ids"], load)
++        self.winrate = list(state["winrate"][: len(self.pool)])
++        self.games = state["games"]
+ 
+     def pfsp(self):
+         """Opponent probabilities: favour the opponents the learner still loses to."""
+@@ -60,6 +89,7 @@ class League:
+ 
+     def game_over(self, i, winner):
+         """Update the PFSP statistics with slot i's finished game and draw its next lineup."""
++        self.games += 1
+         j = self.opponent[i]
+         if j >= 0:
+             won = 0.5 if winner == fc.NO_PLAYER else float(self.learner[i, winner])
+diff --git a/metrics.py b/metrics.py
+index 4aeb91b..0f516db 100644
+--- a/metrics.py
++++ b/metrics.py
+@@ -89,17 +89,18 @@ def summarize(paths, name):
+     out["accept_by_lead"] = {d: rate(int(yes[L == d].sum()), int((L == d).sum())) for d in LEADS}
+ 
+     # Lead slope, controlling for how generous the offer is; 95% interval by resampling games.
+-    X = np.column_stack([L, np.log((np.array([a["gets"] for a in answers]) + 0.5) /
+-                                   (np.array([a["gives"] for a in answers]) + 0.5))])
+-    game_of = np.array([a["game"] for a in answers])
+-    rows_of = defaultdict(list)
+-    for i, g in enumerate(game_of):
+-        rows_of[g].append(i)
+-    ids, rng = list(rows_of), np.random.default_rng(0)
+-    slope = logistic(X, yes)[1]
+-    boot = [logistic(X[j], yes[j])[1] for j in
+-            (np.concatenate([rows_of[g] for g in rng.choice(ids, len(ids))]) for _ in range(200))]
+-    out["lead_slope"] = [round(float(slope), 4), *(round(float(x), 4) for x in np.percentile(boot, [2.5, 97.5]))]
++    out["lead_slope"] = None  # too few answers (or all the same) for a fit
++    if len(answers) >= 20 and 0 < yes.sum() < len(yes):
++        X = np.column_stack([L, np.log((np.array([a["gets"] for a in answers]) + 0.5) /
++                                       (np.array([a["gives"] for a in answers]) + 0.5))])
++        rows_of = defaultdict(list)
++        for i, a in enumerate(answers):
++            rows_of[a["game"]].append(i)
++        ids, rng = list(rows_of), np.random.default_rng(0)
++        slope = logistic(X, yes)[1]
++        boot = [logistic(X[j], yes[j])[1] for j in
++                (np.concatenate([rows_of[g] for g in rng.choice(ids, len(ids))]) for _ in range(200))]
++        out["lead_slope"] = [round(float(slope), 4), *(round(float(x), 4) for x in np.percentile(boot, [2.5, 97.5]))]
+ 
+     turn_lead, offer_lead = np.array([t[1] for t in turns]), np.array([o[1] for o in offers])
+     out["offers_per_turn_by_lead"] = {d: round((offer_lead == d).sum() / max(1, (turn_lead == d).sum()), 3)
+diff --git a/ppo.py b/ppo.py
+index d12fb98..05e9d49 100644
+--- a/ppo.py
++++ b/ppo.py
+@@ -1,11 +1,18 @@
+ """PPO self-play with a league: one network learns, frozen past copies of it are opponents.
+ 
+-    python ppo.py --name ppo_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json]
++    python ppo.py --name ppo_on_s1 --seed 1 --hours 2 [--no-trades] [--config best.json] [--resume]
+ 
+-Writes runs/<name>/: config.json, metrics.jsonl, ckpt_XXXXX.pt (all kept), games/*.jsonl.gz.
++Writes runs/<name>/: config.json, metrics.jsonl, ckpt_<env steps>.pt (every CKPT_EVERY env steps,
++all kept), pool/<id>.pt (league snapshots, only while in the pool), resume.pt (every RESUME_EVERY
++seconds; --resume continues from it after a crash) and games/*.jsonl.gz.
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
++import copy
+ import json
+ import time
+ 
+@@ -15,15 +22,17 @@ import torch
+ from torch import nn
+ from torch.distributions import Categorical
+ 
+-from common import RandomAgent, TradeRules, Trunk, log, observe, play, run_dir, wins
++from common import RandomAgent, TradeRules, Trunk, log, observe, play, resume_run, run_dir, save_resume, wins
+ from league import League
+ 
+-NUM_ENVS, STEPS = 256, 128
+-LR, GAMMA, LAMBDA, CLIP, ENT_COEF, VF_COEF, MAX_GRAD_NORM = 2.5e-4, 0.999, 0.95, 0.2, 0.01, 0.5, 0.5
+-EPOCHS, MINIBATCHES = 4, 8
+-P_SELFPLAY = 0.5
+-WIDTH, DEPTH = 256, 2  # hidden units per layer, hidden layers (policy and value net each)
+-SNAPSHOT_EVERY, CKPT_EVERY, MONITOR_EVERY = 25, 25, 50  # in updates
++NUM_ENVS, STEPS = 1024, 128
++LR, GAMMA, LAMBDA, CLIP, ENT_COEF, VF_COEF, MAX_GRAD_NORM = 1e-4, 0.999, 0.95, 0.2, 0.01, 0.5, 0.5
++EPOCHS, MINIBATCH = 4, 16_384  # rows per gradient step, bounding GPU memory (8 per epoch at the defaults)
++P_SELFPLAY = 0.8  # share of pure self-play games (the same in every trainer)
++WIDTH, DEPTH = 1024, 5  # hidden units per layer, hidden layers (policy and value net each)
++SNAPSHOT_EVERY = 20_000  # finished games between league snapshots (the same in every trainer)
++CKPT_EVERY = 100_000_000  # env steps between kept checkpoints (the same in every trainer)
++MONITOR_EVERY, RESUME_EVERY = 3600, 600  # seconds (the same in every trainer)
+ 
+ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+@@ -40,13 +49,15 @@ class PPOAgent:
+         self.policy, self.value = mlp(fc.NUM_ACTIONS, self.width, self.depth), mlp(1, self.width, self.depth)
+ 
+     def dist(self, obs, mask):
+-        return Categorical(logits=self.policy(obs).masked_fill(~mask, -1e8))  # illegal actions masked
++        return Categorical(logits=self.policy(obs).masked_fill(~mask, -1e8), validate_args=False)  # no checks: each one syncs the GPU
+ 
+     @torch.no_grad()
+     def act(self, env, idx, obs, mask, seat, rules):
+         obs = torch.from_numpy(obs).to(device)
+-        action = self.dist(obs, torch.from_numpy(mask).to(device)).sample()
+-        return action.cpu().numpy().astype(np.uint32), self.value(obs).squeeze(-1).cpu().numpy()
++        action = self.dist(obs, torch.from_numpy(mask).to(device)).sample().cpu().numpy().astype(np.uint32)
++        if self.value is None:  # a league copy: it only plays
++            return action, None
++        return action, self.value(obs).squeeze(-1).cpu().numpy()
+ 
+     @torch.no_grad()
+     def probs(self, env, idx, obs, mask, seat, rules):
+@@ -58,7 +69,7 @@ class PPOAgent:
+ 
+     @classmethod
+     def load(cls, path):
+-        ckpt = torch.load(path, map_location=device)
++        ckpt = torch.load(path, map_location=device, weights_only=True)
+         agent = cls(ckpt["width"], ckpt["depth"])
+         agent.policy.load_state_dict(ckpt["policy"])
+         agent.value.load_state_dict(ckpt["value"])
+@@ -88,24 +99,66 @@ def advantages(values, seats, dones, rewards, bootstrap):
+     return adv
+ 
+ 
+-def train(name, seed, hours, trades, config=None):
++def pool_agent(out, id):
++    """League snapshot `id` from <run>/pool/, without its value net (pool copies only play)."""
++    agent = PPOAgent.load(out / "pool" / f"{id}.pt")
++    agent.value = None
++    return agent
++
++
++def train(name, seed=1, hours=None, trades=True, config=None, resume=False):
++    """resume: continue runs/<name>/ from its resume.pt with its own settings (start it if it is new).
++    Games in progress at the crash are not restored: every slot starts a new game."""
++    resumed = resume_run(name, hours) if resume else None
++    if resumed:
++        out, saved, state = resumed
++        seed, trades, hours = saved["seed"], saved["trades"], saved["hours"]
++        config = {k: v for k, v in saved.items() if k.isupper()}
++    else:
++        state, hours = None, 1.0 if hours is None else hours
++    if unknown := set(config or {}) - {k for k in globals() if k.isupper()}:
++        raise ValueError(f"--config has unknown constants: {sorted(unknown)}")
+     globals().update(config or {})  # overrides of the constants above, e.g. from hpsearch.py
+-    torch.manual_seed(seed)
+-    np.random.seed(seed)
+-    constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
+-    out = run_dir(name, dict(algo="ppo", seed=seed, hours=hours, trades=trades, **constants))
+-
+-    agent, rnd = PPOAgent(), RandomAgent(seed)
++    resumes = state["resumes"] + 1 if state else 0
++    rs = seed + 10_007 * resumes  # fresh random streams after each resume
++    torch.manual_seed(rs)
++    np.random.seed(rs)
++    if not state:
++        constants = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float))}
++        out = run_dir(name, dict(algo="ppo", seed=seed, hours=hours, trades=trades, **constants))
++
++    agent, rnd = PPOAgent(), RandomAgent(rs)
+     params = [*agent.policy.parameters(), *agent.value.parameters()]
+     opt = torch.optim.Adam(params, lr=LR, eps=1e-5)
+-    env = fc.BatchedEnv(NUM_ENVS, seed=seed)
++    env = fc.BatchedEnv(NUM_ENVS, seed=rs)
+     env.reset()
+     rules = TradeRules(NUM_ENVS, trades)
+-    league = League(NUM_ENVS, P_SELFPLAY, seed=seed)
++    league = League(NUM_ENVS, P_SELFPLAY, seed=rs)
+     done = np.zeros(NUM_ENVS, np.uint8)
+     steps_in_game = np.zeros(NUM_ENVS, np.int64)
+     start, env_steps, update = time.time(), 0, 0
+-    agent.save(out / "ckpt_00000.pt", update=0, env_steps=0)
++    snapshots = last_snapshot = 0  # snapshots taken; league.games at the last one
++    if state:
++        agent.policy.load_state_dict(state["policy"])
++        agent.value.load_state_dict(state["value"])
++        opt.load_state_dict(state["opt"])
++        league.load_state(state["league"], lambda id: pool_agent(out, id))
++        start -= state["elapsed"]
++        env_steps, update, snapshots, last_snapshot = (state[k] for k in ("env_steps", "update", "snapshots",
++                                                                          "last_snapshot"))
++        log(out, dict(resumed=resumes, hours=state["elapsed"] / 3600, env_steps=env_steps))
++    else:
++        agent.save(out / f"ckpt_{0:012d}.pt", update=0, env_steps=0)
++
++    def save_state():
++        save_resume(out, dict(resumes=resumes, elapsed=time.time() - start, env_steps=env_steps, update=update,
++                              snapshots=snapshots, last_snapshot=last_snapshot, policy=agent.policy.state_dict(),
++                              value=agent.value.state_dict(), opt=opt.state_dict(), league=league.state()),
++                    league.ids)
++
++    save_state()
++    next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
++    last_monitor = last_resume = time.time()
+ 
+     while time.time() - start < hours * 3600:
+         update += 1
+@@ -158,7 +211,7 @@ def train(name, seed, hours, trades, config=None):
+         act, logp_old = torch.cat(buf["act"])[mine], torch.cat(buf["logp"])[mine]
+ 
+         for _ in range(EPOCHS):
+-            for mb in torch.randperm(len(act), device=device).chunk(MINIBATCHES):
++            for mb in torch.randperm(len(act), device=device).chunk(-(-len(act) // MINIBATCH)):  # equal sizes
+                 d = agent.dist(obs[mb], mask[mb])
+                 ratio = (d.log_prob(act[mb]) - logp_old[mb]).exp()
+                 a = (adv[mb] - adv[mb].mean()) / (adv[mb].std() + 1e-8)
+@@ -171,28 +224,42 @@ def train(name, seed, hours, trades, config=None):
+                 opt.step()
+ 
+         env_steps += NUM_ENVS * STEPS
+-        if update % SNAPSHOT_EVERY == 0:
+-            league.add(agent)
++        if league.games - last_snapshot >= SNAPSHOT_EVERY:
++            snapshots, last_snapshot = snapshots + 1, league.games
++            agent.save(out / "pool" / f"{snapshots}.pt", update=update, env_steps=env_steps)
++            frozen = copy.copy(agent)
++            frozen.value = None  # pool copies only play: no value net to copy and run
++            league.add(frozen, snapshots)
+         row = dict(update=update, env_steps=env_steps, hours=(time.time() - start) / 3600, games=len(finished),
++                   total_games=league.games,
+                    steps_per_turn=float(sum(s for s, _ in finished) / max(1, sum(t for _, t in finished))),
+                    pg_loss=pg_loss.item(), v_loss=v_loss.item(), entropy=entropy.item(),
+                    pool=len(league.pool), pool_winrate=float(np.mean(league.winrate)))
+-        if update % MONITOR_EVERY == 0:
++        if time.time() - last_monitor > MONITOR_EVERY:
+             row["vs_random"] = wins(play([agent, rnd, agent, rnd], 50, 10_000, trades), [0, 2]) / 50
+             play([agent] * 4, 2, 20_000, trades, log_path=out / "games" / f"update_{update:05d}.jsonl.gz")
+-        if update % CKPT_EVERY == 0:
+-            agent.save(out / f"ckpt_{update:05d}.pt", update=update, env_steps=env_steps)
++            last_monitor = time.time()
++        if env_steps >= next_ckpt:  # kept for good, unlike the pool snapshots
++            agent.save(out / f"ckpt_{next_ckpt:012d}.pt", update=update, env_steps=env_steps)
++            next_ckpt = (env_steps // CKPT_EVERY + 1) * CKPT_EVERY
+         log(out, row)
++        if time.time() - last_resume > RESUME_EVERY:
++            save_state()
++            last_resume = time.time()
+ 
+-    agent.save(out / f"ckpt_{update:05d}.pt", update=update, env_steps=env_steps)
++    agent.save(out / f"ckpt_{env_steps:012d}.pt", update=update, env_steps=env_steps)
++    save_state()  # --resume --hours <more> trains on
+ 
+ 
+ if __name__ == "__main__":
+     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("--name", required=True)
+     p.add_argument("--seed", type=int, default=1)
+-    p.add_argument("--hours", type=float, default=1.0, help="wall-clock training budget")
++    p.add_argument("--hours", type=float, help="wall-clock training budget (default 1); with --resume: a new total")
+     p.add_argument("--no-trades", action="store_true", help="block player trades for every seat")
+     p.add_argument("--config", help="JSON file overriding the constants above (e.g. hpsearch's best)")
++    p.add_argument("--resume", action="store_true",
++                   help="continue runs/<name>/ from resume.pt with its own settings, or start it if it is new")
+     args = p.parse_args()
+-    train(args.name, args.seed, args.hours, not args.no_trades, json.load(open(args.config)) if args.config else None)
++    train(args.name, args.seed, args.hours, not args.no_trades,
++          json.load(open(args.config)) if args.config else None, args.resume)
+diff --git a/ppo_demo.py b/ppo_demo.py
+index d74ad75..067debb 100644
+--- a/ppo_demo.py
++++ b/ppo_demo.py
+@@ -7,7 +7,7 @@ import numpy as np
+ import torch
+ from torch import nn
+ from torch.distributions import Categorical
+-from fastcatan_viz import GameLogWriter
++from fastcatan.viz import GameLogWriter
+ 
+ NUM_ENVS, STEPS, UPDATES = 256, 128, 1500  # 1500 x 256 x 128 = 49M steps
+ LR, GAMMA, LAMBDA, CLIP, ENT_COEF = 2.5e-4, 0.999, 0.95, 0.2, 0.01
+diff --git a/probe.py b/probe.py
+index 3937ae9..dbce026 100644
+--- a/probe.py
++++ b/probe.py
+@@ -14,12 +14,17 @@ a trade (the other responders decline first) and the agent's probability that R
+ Intervals are 95% bootstrap intervals over states. Rows go to results/probe.jsonl.
+ """
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import argparse
+ import copy
+ import json
+ 
+ import fastcatan as fc
+ import numpy as np
++import torch
+ 
+ from common import ADD, ROOT, A, TradeRules, observe, run
+ from evaluate import load
+@@ -109,6 +114,7 @@ def main():
+     p.add_argument("agent")
+     p.add_argument("--states", type=int, default=300)
+     args = p.parse_args()
++    torch.manual_seed(0)  # PPO samples its moves with torch's RNG
+     agent = load(args.agent)
+     if getattr(agent, "n_sims", 0):  # AlphaZero: lead edits only reach the network
+         raw = copy.copy(agent)
+diff --git a/test_core.py b/test_core.py
+index 16ed20f..21ef390 100644
+--- a/test_core.py
++++ b/test_core.py
+@@ -1,5 +1,9 @@
+ """Hand-case checks for the tricky parts. Run: .venv/bin/python -m pytest -q"""
+ 
++import os
++
++os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
++
+ import fastcatan as fc
+ import numpy as np
+ import pytest
+@@ -177,3 +181,47 @@ def test_probs_are_distributions_over_legal_actions():
+     for agent in (RandomAgent(0), PPOAgent(), DQNAgent(eps=0.1), AZAgent(n_sims=0), AZAgent(n_sims=4), AlphaBeta(k=1)):
+         p = agent.probs(env, np.arange(n), obs, mask, seat, rules)
+         assert p.shape == (n, fc.NUM_ACTIONS) and np.allclose(p.sum(1), 1, atol=1e-5) and (p[~mask] < 1e-6).all()
++
++
++def test_league_state_round_trip():
++    league = League(8, 0.5, size=4, seed=0)
++    for i in range(1, 7):  # 6 snapshots into 3 slots: random evictions
++        league.add(RandomAgent(i), id=i)
++    league.winrate[1], league.games = 0.9, 42
++    copy_ = League(8, 0.5, size=4, seed=1)
++    copy_.load_state(league.state(), lambda id: RandomAgent(id))
++    assert copy_.ids == league.ids and copy_.winrate == league.winrate and copy_.games == 42
++    partial = League(8, 0.5, size=4, seed=1)  # a missing file stops the sync; the rest waits for the next one
++    partial.sync(league.ids, lambda id: None if id == league.ids[2] else RandomAgent(id))
++    assert partial.ids == league.ids[:2]
++
++
++def test_ppo_resume_after_a_crash(tmp_path, monkeypatch):
++    import json
++
++    import torch
++
++    import common
++    import ppo
++
++    monkeypatch.setattr(common, "ROOT", tmp_path)
++    for k in [k for k in vars(ppo) if k.isupper()]:  # train() overrides the module constants
++        monkeypatch.setattr(ppo, k, getattr(ppo, k))
++    cfg = dict(NUM_ENVS=128, STEPS=16, WIDTH=32, DEPTH=1, SNAPSHOT_EVERY=5, RESUME_EVERY=1, CKPT_EVERY=50_000)
++    ppo.train("r", 3, 0.002, True, cfg)
++    run = tmp_path / "runs" / "r"
++    with open(run / "metrics.jsonl", "a") as f:  # the crash: a row after the last save, a line cut off
++        f.write(json.dumps(dict(update=10**6, hours=99.0)) + '\n{"upd')
++    (run / "pool" / "999.pt").write_bytes(b"")  # a snapshot the saved league no longer holds
++
++    ppo.train("r", hours=0.004, resume=True)
++    rows = [json.loads(line) for line in open(run / "metrics.jsonl")]
++    hours = [r["hours"] for r in rows]
++    assert hours == sorted(hours) and max(hours) < 99 and sum("resumed" in r for r in rows) == 1
++    state = torch.load(run / "resume.pt", weights_only=True)
++    assert state["resumes"] == 1 and state["elapsed"] >= 0.004 * 3600 and state["snapshots"] > 0
++    assert json.loads((run / "config.json").read_text())["seed"] == 3
++    on_disk = {int(p.stem) for p in (run / "pool").glob("*.pt")}
++    assert on_disk == {i for i in state["league"]["ids"] if i is not None}
++    ckpts = sorted(p.name for p in run.glob("ckpt_*.pt"))
++    assert ckpts[0] == f"ckpt_{0:012d}.pt" and ckpts[-1] == f"ckpt_{state['env_steps']:012d}.pt" and len(ckpts) > 2

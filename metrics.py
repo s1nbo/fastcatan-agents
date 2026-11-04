@@ -89,17 +89,18 @@ def summarize(paths, name):
     out["accept_by_lead"] = {d: rate(int(yes[L == d].sum()), int((L == d).sum())) for d in LEADS}
 
     # Lead slope, controlling for how generous the offer is; 95% interval by resampling games.
-    X = np.column_stack([L, np.log((np.array([a["gets"] for a in answers]) + 0.5) /
-                                   (np.array([a["gives"] for a in answers]) + 0.5))])
-    game_of = np.array([a["game"] for a in answers])
-    rows_of = defaultdict(list)
-    for i, g in enumerate(game_of):
-        rows_of[g].append(i)
-    ids, rng = list(rows_of), np.random.default_rng(0)
-    slope = logistic(X, yes)[1]
-    boot = [logistic(X[j], yes[j])[1] for j in
-            (np.concatenate([rows_of[g] for g in rng.choice(ids, len(ids))]) for _ in range(200))]
-    out["lead_slope"] = [round(float(slope), 4), *(round(float(x), 4) for x in np.percentile(boot, [2.5, 97.5]))]
+    out["lead_slope"] = None  # too few answers (or all the same) for a fit
+    if len(answers) >= 20 and 0 < yes.sum() < len(yes):
+        X = np.column_stack([L, np.log((np.array([a["gets"] for a in answers]) + 0.5) /
+                                       (np.array([a["gives"] for a in answers]) + 0.5))])
+        rows_of = defaultdict(list)
+        for i, a in enumerate(answers):
+            rows_of[a["game"]].append(i)
+        ids, rng = list(rows_of), np.random.default_rng(0)
+        slope = logistic(X, yes)[1]
+        boot = [logistic(X[j], yes[j])[1] for j in
+                (np.concatenate([rows_of[g] for g in rng.choice(ids, len(ids))]) for _ in range(200))]
+        out["lead_slope"] = [round(float(slope), 4), *(round(float(x), 4) for x in np.percentile(boot, [2.5, 97.5]))]
 
     turn_lead, offer_lead = np.array([t[1] for t in turns]), np.array([o[1] for o in offers])
     out["offers_per_turn_by_lead"] = {d: round((offer_lead == d).sum() / max(1, (turn_lead == d).sum()), 3)

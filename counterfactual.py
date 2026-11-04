@@ -10,12 +10,17 @@ play the rollouts with their network alone (a full search per move would take da
 Rows go to results/counterfactual.jsonl: the summary and every trade with its context.
 """
 
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")  # before numpy/torch/fastcatan load (see common.py)
+
 import argparse
 import copy
 import json
 
 import fastcatan as fc
 import numpy as np
+import torch
 
 from common import ROOT, A, TradeRules, run
 from evaluate import load
@@ -77,6 +82,7 @@ def main():
     p.add_argument("--trades", type=int, default=200)
     p.add_argument("--rollouts", type=int, default=200, help="per branch")
     args = p.parse_args()
+    torch.manual_seed(0)  # PPO samples its moves with torch's RNG
     agent = load(args.agent)
     if getattr(agent, "n_sims", 0):  # AlphaZero: roll out with the network alone
         agent = copy.copy(agent)
